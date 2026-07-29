@@ -56,13 +56,22 @@ jobs:
             gravitee-secret-provider-gcp-core/target/gravitee-secret-provider-gcp-core-*.jar
           retention-days: 7
 
-  # Resolves the real synthetic secret out of the real GCP Secret Manager. Separate job because it
-  # needs Workload Identity Federation, which a fork PR cannot obtain: GitHub does not grant
-  # `id-token: write` to workflows triggered from a fork, so this is skipped there rather than
-  # failing confusingly for external contributors.
+  # Resolves the real synthetic secret out of the real GCP Secret Manager.
+  #
+  # Skipped in two cases rather than failed:
+  #
+  #   * fork pull requests — GitHub does not grant `id-token: write` to them, so WIF is impossible
+  #     and an external contributor would otherwise see a confusing red build;
+  #   * GHA_WIF_PROVIDER unset — the repository variables are provisioned by Terraform
+  #     (Fluent-Health/infra, github/repos.tf `gha`), so until that is applied there is nothing to
+  #     authenticate with. An empty `vars` value makes google-github-actions/auth fail with
+  #     "must specify exactly one of workload_identity_provider or credentials_json", which says
+  #     nothing about the actual cause.
   live-gcp:
     needs: build
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      vars.GHA_WIF_PROVIDER != '' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
 
     permissions:
