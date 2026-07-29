@@ -40,7 +40,7 @@ class GcpConfigTest {
                 "enabled",
                 true,
                 "projectId",
-                "fh-apim-prod",
+                "example-project",
                 "defaultVersion",
                 "3",
                 "connectTimeoutMs",
@@ -53,7 +53,7 @@ class GcpConfigTest {
         );
 
         assertThat(config.isEnabled()).isTrue();
-        assertThat(config.projectId()).isEqualTo("fh-apim-prod");
+        assertThat(config.projectId()).isEqualTo("example-project");
         assertThat(config.defaultVersion()).isEqualTo("3");
         assertThat(config.connectTimeoutMs()).isEqualTo(1_500);
         assertThat(config.requestTimeoutMs()).isEqualTo(4_000);
@@ -63,7 +63,7 @@ class GcpConfigTest {
     @Test
     void should_coerce_string_values_because_gravitee_yml_properties_arrive_as_strings() {
         GcpConfig config = new GcpConfig(
-            Map.of("enabled", "true", "projectId", "fh-apim-prod", "connectTimeoutMs", "2000", "secretTtlSeconds", "90")
+            Map.of("enabled", "true", "projectId", "example-project", "connectTimeoutMs", "2000", "secretTtlSeconds", "90")
         );
 
         assertThat(config.isEnabled()).isTrue();
@@ -73,7 +73,7 @@ class GcpConfigTest {
 
     @Test
     void should_default_to_latest_version_so_rotation_is_picked_up_without_a_redeploy() {
-        GcpConfig config = new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-prod"));
+        GcpConfig config = new GcpConfig(Map.of("enabled", true, "projectId", "example-project"));
 
         assertThat(config.defaultVersion()).isEqualTo("latest");
         assertThat(config.secretTtl()).isEqualTo(Duration.ofSeconds(300));
@@ -92,7 +92,9 @@ class GcpConfigTest {
 
     @Test
     void should_switch_to_service_account_key_when_one_is_configured() {
-        GcpConfig config = new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-dev", "serviceAccountKeyFile", "/etc/gcp/sa.json"));
+        GcpConfig config = new GcpConfig(
+            Map.of("enabled", true, "projectId", "example-project", "serviceAccountKeyFile", "/etc/gcp/sa.json")
+        );
 
         assertThat(config.serviceAccountKeyFile()).isEqualTo("/etc/gcp/sa.json");
         assertThat(config.usesMetadataServer()).isFalse();

@@ -45,7 +45,7 @@ class GcpSecretsElHolderTest {
      * should_refetch_once_the_ttl_has_lapsed_so_a_rotation_is_picked_up.
      */
     private static final Clock CLOCK = Clock.systemUTC();
-    private static final GcpConfig CONFIG = new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-test", "secretTtlSeconds", 300));
+    private static final GcpConfig CONFIG = new GcpConfig(Map.of("enabled", true, "projectId", "example-project", "secretTtlSeconds", 300));
 
     private final List<String> requested = new ArrayList<>();
 
@@ -128,7 +128,7 @@ class GcpSecretsElHolderTest {
             requested.add(secret + "/" + version);
             return Maybe.just("{\"password\":\"s3cr3t\"}".getBytes(StandardCharsets.UTF_8));
         };
-        GcpConfig shortTtl = new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-test", "secretTtlSeconds", 1));
+        GcpConfig shortTtl = new GcpConfig(Map.of("enabled", true, "projectId", "example-project", "secretTtlSeconds", 1));
         GcpSecretsElHolder holder = new GcpSecretsElHolder(new CachingGcpSecretResolver(client, shortTtl, clockInThePast));
 
         holder.get("/gcp/db-credentials:password").test().awaitDone(5, TimeUnit.SECONDS).assertComplete();

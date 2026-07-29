@@ -63,7 +63,7 @@ class MetadataServerTokenProviderTest {
 
     private GcpConfig config() {
         return new GcpConfig(
-            Map.of("enabled", true, "projectId", "fh-apim-test", "metadataBaseUrl", "http://localhost:" + metadataServer.port())
+            Map.of("enabled", true, "projectId", "example-project", "metadataBaseUrl", "http://localhost:" + metadataServer.port())
         );
     }
 

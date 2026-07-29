@@ -21,7 +21,7 @@ metadata:
   description: Gravitee APIM secret-provider plugin resolving secrets from GCP Secret Manager, with an OSS expression-language shim.
   annotations:
     github.com/project-slug: Fluent-Health/gravitee-secret-provider-gcp
-    fluentinhealth.com/oss: published
+    fluentinhealth.com/oss: pending
 spec:
   type: library
   lifecycle: production

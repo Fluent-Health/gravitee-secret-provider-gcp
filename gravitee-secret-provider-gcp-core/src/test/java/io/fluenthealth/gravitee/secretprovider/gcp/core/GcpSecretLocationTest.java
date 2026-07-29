@@ -24,7 +24,7 @@ import org.junit.jupiter.api.Test;
 
 class GcpSecretLocationTest {
 
-    private static final GcpConfig CONFIG = new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-test"));
+    private static final GcpConfig CONFIG = new GcpConfig(Map.of("enabled", true, "projectId", "example-project"));
 
     private static GcpSecretLocation location(String url) {
         return GcpSecretLocation.from(SecretURL.from(url), CONFIG);
@@ -64,7 +64,7 @@ class GcpSecretLocationTest {
 
     @Test
     void should_honour_a_configured_default_version() {
-        GcpConfig pinned = new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-test", "defaultVersion", "4"));
+        GcpConfig pinned = new GcpConfig(Map.of("enabled", true, "projectId", "example-project", "defaultVersion", "4"));
 
         GcpSecretLocation location = GcpSecretLocation.from(SecretURL.from("secret://gcp/db-password:password"), pinned);
 

@@ -210,4 +210,6 @@ back — there is a test for the TTL, but the reason is here.
   definition, are still to write. `GcpSecretsElEvaluationTest` covers the EL contract against the
   real EL implementation, which is the part most likely to break, but it does not prove plugin
   loading or bean discovery inside a running gateway.
-- Image baking and the Helm/Terraform wiring live in `Fluent-Health/infra`.
+- Deployment is out of scope for this repo: getting the artifacts onto a gateway (baked into an
+  image or mounted) and wiring `secrets.gcp.*` plus the `el.whitelist.list` entries through whatever
+  manages your gateway configuration.

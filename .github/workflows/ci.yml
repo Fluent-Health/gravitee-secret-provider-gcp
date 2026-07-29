@@ -62,11 +62,13 @@ jobs:
   #
   #   * fork pull requests — GitHub does not grant `id-token: write` to them, so WIF is impossible
   #     and an external contributor would otherwise see a confusing red build;
-  #   * GHA_WIF_PROVIDER unset — the repository variables are provisioned by Terraform
-  #     (Fluent-Health/infra, github/repos.tf `gha`), so until that is applied there is nothing to
-  #     authenticate with. An empty `vars` value makes google-github-actions/auth fail with
-  #     "must specify exactly one of workload_identity_provider or credentials_json", which says
-  #     nothing about the actual cause.
+  #   * GHA_WIF_PROVIDER unset — the repository variables are provisioned outside this repo, so on a
+  #     fork (or before they are set) there is nothing to authenticate with. An empty `vars` value
+  #     makes google-github-actions/auth fail with "must specify exactly one of
+  #     workload_identity_provider or credentials_json", which says nothing about the actual cause.
+  #
+  # GCP_E2E_SECRET_NAME names a secret whose payload is a flat JSON object with `username` and
+  # `password` keys; the test asserts structure, not values, so any such secret works.
   live-gcp:
     needs: build
     if: >-
@@ -107,3 +109,4 @@ jobs:
         env:
           GCP_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_E2E_SECRET_NAME: ${{ vars.GCP_E2E_SECRET_NAME }}
