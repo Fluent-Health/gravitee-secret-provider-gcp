@@ -59,7 +59,13 @@ import org.springframework.core.env.StandardEnvironment;
  */
 class GcpSecretsElEvaluationTest {
 
-    private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-07-29T12:00:00Z"), ZoneOffset.UTC);
+    /*
+     * System clock, not a fixed one: SecretMap#isExpired compares against Instant.now(), so a fixed
+     * clock makes cached entries expire in wall-clock terms once real time passes it plus the TTL.
+     * Nothing here asserts a fetch count, so it would not fail — but it would silently stop
+     * exercising the cache. See the longer note in GcpSecretsElHolderTest.
+     */
+    private static final Clock CLOCK = Clock.systemUTC();
     private static final String HOLDER = GcpSecretsElHolder.class.getName();
 
     /** The two lines that must be present under {@code el.whitelist.list} in {@code gravitee.yml}. */
