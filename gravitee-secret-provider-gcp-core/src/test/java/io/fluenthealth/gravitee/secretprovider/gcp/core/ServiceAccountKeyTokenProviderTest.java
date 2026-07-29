@@ -85,7 +85,7 @@ class ServiceAccountKeyTokenProviderTest {
             keyFile,
             new JsonObject()
                 .put("type", "service_account")
-                .put("client_email", "apim@fh-apim-dev.iam.gserviceaccount.com")
+                .put("client_email", "apim@example-project.iam.gserviceaccount.com")
                 .put("private_key", pem)
                 .put("token_uri", "http://localhost:" + tokenEndpoint.port() + "/token")
                 .encode()
@@ -94,7 +94,7 @@ class ServiceAccountKeyTokenProviderTest {
     }
 
     private GcpConfig config(Path keyFile) {
-        return new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-dev", "serviceAccountKeyFile", keyFile.toString()));
+        return new GcpConfig(Map.of("enabled", true, "projectId", "example-project", "serviceAccountKeyFile", keyFile.toString()));
     }
 
     @Test
@@ -138,13 +138,13 @@ class ServiceAccountKeyTokenProviderTest {
         String assertion = java.net.URLDecoder.decode(body.split("assertion=")[1], StandardCharsets.UTF_8);
         assertThat(assertion.split("\\.")).hasSize(3);
         String claims = new String(Base64.getUrlDecoder().decode(assertion.split("\\.")[1]), StandardCharsets.UTF_8);
-        assertThat(claims).contains("apim@fh-apim-dev.iam.gserviceaccount.com").contains("cloud-platform");
+        assertThat(claims).contains("apim@example-project.iam.gserviceaccount.com").contains("cloud-platform");
     }
 
     @Test
     void should_fail_with_a_clear_error_when_the_key_file_is_missing() {
         GcpConfig config = new GcpConfig(
-            Map.of("enabled", true, "projectId", "fh-apim-dev", "serviceAccountKeyFile", tempDir.resolve("absent.json").toString())
+            Map.of("enabled", true, "projectId", "example-project", "serviceAccountKeyFile", tempDir.resolve("absent.json").toString())
         );
 
         assertThatThrownBy(() -> new ServiceAccountKeyTokenProvider(webClient, config, Clock.systemUTC()))

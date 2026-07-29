@@ -56,7 +56,7 @@ Under `secrets.gcp` in `gravitee.yml` (or as `GRAVITEE_SECRETS_GCP_*` environmen
 secrets:
   gcp:
     enabled: true
-    projectId: fh-apim-prod # required when enabled
+    projectId: my-gcp-project # required when enabled
     defaultVersion: latest # version used when a URL names none
     secretTtlSeconds: 300 # how long a resolved secret is reused; see Rotation
     connectTimeoutMs: 3000
@@ -83,8 +83,8 @@ The gateway authenticates as its Workload Identity service account — no static
 
 ```bash
 gcloud secrets add-iam-policy-binding db-password \
-  --project fh-apim-prod \
-  --member "serviceAccount:apim-gateway@fh-apim-prod.iam.gserviceaccount.com" \
+  --project my-gcp-project \
+  --member "serviceAccount:apim-gateway@my-gcp-project.iam.gserviceaccount.com" \
   --role roles/secretmanager.secretAccessor
 ```
 
@@ -198,13 +198,40 @@ No API definition changes. The shim registers the EL variable `secrets` with the
 
 ## Development
 
-Prerequisites: JDK 21, Maven, Docker (only for reading versions off the gateway image).
+Prerequisites: JDK 21, Maven, and Docker for the integration test.
 
 ```bash
-mvn verify                          # tests + prettier:check + license:check
-mvn test -Dskip.validation=true     # fast loop
-mvn prettier:write license:format   # fix formatting and headers
+mvn verify                          # unit tests + prettier:check + license:check
+mvn verify -Pintegration-test       # ... and boot a real gateway with the artifacts installed
+mvn test -Dskip.validation=true     # fast loop, no lint
+mvn prettier:write license:format   # fix formatting and licence headers
 ```
+
+`-Pintegration-test` is what covers the parts of this that live in the gateway rather than in the
+code — classloader placement, the `spring.factories` registration, and secret-provider configuration
+discovery. It needs Docker but no GCP account, and it runs on every pull request.
+
+There is also an optional profile that resolves a secret out of a real GCP Secret Manager. It needs a
+project, a token, and a secret of your own whose payload is a flat JSON object with `username` and
+`password` keys:
+
+```bash
+export GCP_ACCESS_TOKEN=$(gcloud auth print-access-token)
+export GCP_PROJECT_ID=your-project
+export GCP_E2E_SECRET_NAME=your-secret
+mvn verify -Pgcloud-integration-test
+```
+
+Its assertions are structural, so any secret of that shape works. It is skipped in CI for forks,
+since GitHub does not issue OIDC tokens to fork pull requests.
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md). Bug reports and pull requests are welcome; no CLA is
+required.
+
+Reporting a security issue: see [SECURITY.md](./SECURITY.md) — please use private vulnerability
+reporting rather than a public issue.
 
 ## Licence
 

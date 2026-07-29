@@ -173,7 +173,7 @@ class GcpGatewayBootstrapIT {
             secrets:
               gcp:
                 enabled: true
-                projectId: fh-dev-svc
+                projectId: example-project
                 baseUrl: http://secret-manager.invalid
                 metadataBaseUrl: http://metadata.invalid
                 el:

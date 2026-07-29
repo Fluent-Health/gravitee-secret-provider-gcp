@@ -35,42 +35,43 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
- * Resolves the real end-to-end secret out of the real GCP Secret Manager.
+ * Resolves a real secret out of a real GCP Secret Manager.
  *
  * <p>This is the test that proves the things only production GCP can: that the REST contract is what
- * we think it is, that the base64 payload decodes, that the IAM binding Terraform creates is
- * sufficient, and that the payload-as-secret-map convention lines up with the value Terraform writes.
- * It goes through {@link GcpSecretsElHolder} — the same object the expression language calls — so the
- * code path is the production one, minus the gateway.
+ * we think it is, that the base64 payload decodes, that a {@code secretAccessor} grant is sufficient,
+ * and that the payload-as-secret-map convention holds against a real payload. It goes through
+ * {@link GcpSecretsElHolder} — the same object the expression language calls — so the code path is
+ * the production one, minus the gateway.
  *
- * <p>The secret and the IAM binding are owned by
- * {@code components/pipelines/gravitee-secret-provider-gcp} in Fluent-Health/infra. Its value is
- * synthetic, which is why asserting it here in the clear is fine.
+ * <h2>Running it</h2>
+ *
+ * Point it at any secret you own whose payload is a flat JSON object with {@code username} and
+ * {@code password} keys, e.g. {@code {"username":"someone","password":"whatever"}}:
+ *
+ * <pre>
+ * gcloud secrets create gravitee-gcp-e2e --replication-policy=automatic
+ * printf '{"username":"e2e","password":"synthetic"}' | \
+ *   gcloud secrets versions add gravitee-gcp-e2e --data-file=-
+ *
+ * export GCP_ACCESS_TOKEN=$(gcloud auth print-access-token)
+ * export GCP_PROJECT_ID=your-project
+ * export GCP_E2E_SECRET_NAME=gravitee-gcp-e2e
+ * mvn verify -Pgcloud-integration-test
+ * </pre>
+ *
+ * Assertions are structural rather than exact values, so any secret of that shape works — and no
+ * project or secret name is baked into the source.
  *
  * <p>The access token is injected rather than fetched by one of the plugin's own token providers.
  * There is no metadata server outside GCP, and Workload Identity Federation hands CI an
  * {@code external_account} credential, which the service-account-key provider cannot consume. What
  * this test covers is the Secret Manager half; token minting on GKE is covered by
  * {@code MetadataServerTokenProviderTest}.
- *
- * <p>Run with {@code mvn verify -Pgcloud-integration-test}, having exported a token:
- *
- * <pre>
- * export GCP_ACCESS_TOKEN=$(gcloud auth print-access-token)
- * </pre>
- *
- * In CI the token comes from {@code google-github-actions/auth} with
- * {@code token_format: access_token}.
  */
 @Tag("gcloud-integration")
 class GcpSecretManagerLiveIT {
 
-    /** Created by Terraform; see the class comment. */
-    private static final String SECRET_NAME = "apim-gcp-secret-provider-e2e-password";
-
-    private static final String EXPECTED_PASSWORD = "e2e-synthetic-not-a-real-secret";
-    private static final String EXPECTED_USERNAME = "e2e-user";
-
+    private String secretName;
     private Vertx vertx;
     private WebClient webClient;
     private GcpSecretsElHolder holder;
@@ -82,8 +83,8 @@ class GcpSecretManagerLiveIT {
                 return defaultValue;
             }
             throw new IllegalStateException(
-                ("%s is not set. This profile talks to real GCP; export a token first:\n" +
-                    "  export GCP_ACCESS_TOKEN=$(gcloud auth print-access-token)").formatted(name)
+                ("%s is not set. This profile talks to real GCP — see the class comment for the three " +
+                    "variables it needs and how to create a suitable secret.").formatted(name)
             );
         }
         return value;
@@ -92,7 +93,8 @@ class GcpSecretManagerLiveIT {
     @BeforeEach
     void setUp() {
         String token = required("GCP_ACCESS_TOKEN", null);
-        String projectId = required("GCP_PROJECT_ID", "fh-dev-svc");
+        String projectId = required("GCP_PROJECT_ID", null);
+        secretName = required("GCP_E2E_SECRET_NAME", null);
 
         vertx = Vertx.vertx();
         webClient = WebClient.create(vertx);
@@ -117,29 +119,29 @@ class GcpSecretManagerLiveIT {
     }
 
     @Test
-    void should_resolve_a_key_out_of_the_real_secret() {
+    void should_resolve_a_key_out_of_a_real_secret() {
         String value = holder
-            .get("/gcp/%s:password".formatted(SECRET_NAME))
+            .get("/gcp/%s:password".formatted(secretName))
             .test()
             .awaitDone(30, TimeUnit.SECONDS)
             .assertComplete()
             .values()
             .getFirst();
 
-        assertThat(value).isEqualTo(EXPECTED_PASSWORD);
+        assertThat(value).as("the 'password' key of the secret's flat-JSON payload").isNotBlank();
     }
 
     /** The same secret, a different key — the flat-JSON-object convention against a real payload. */
     @Test
     void should_resolve_a_second_key_from_the_same_secret() {
         String value = holder
-            .get("/gcp/%s".formatted(SECRET_NAME), "username")
+            .get("/gcp/%s".formatted(secretName), "username")
             .test()
             .awaitDone(30, TimeUnit.SECONDS)
             .assertComplete()
             .values()
             .getFirst();
 
-        assertThat(value).isEqualTo(EXPECTED_USERNAME);
+        assertThat(value).as("the 'username' key, proving the payload really parsed as a map").isNotBlank();
     }
 }

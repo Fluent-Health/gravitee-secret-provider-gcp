@@ -39,7 +39,7 @@ import org.junit.jupiter.api.Test;
 
 class RestGcpSecretManagerClientTest {
 
-    private static final String PROJECT = "fh-apim-test";
+    private static final String PROJECT = "example-project";
 
     private WireMockServer secretManager;
     private Vertx vertx;

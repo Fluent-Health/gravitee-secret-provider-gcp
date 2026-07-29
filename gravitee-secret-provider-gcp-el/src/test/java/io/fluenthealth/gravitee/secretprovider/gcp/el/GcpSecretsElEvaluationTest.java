@@ -90,7 +90,7 @@ class GcpSecretsElEvaluationTest {
             requested.add(secret);
             return Maybe.just(payload.getBytes(StandardCharsets.UTF_8));
         };
-        GcpConfig config = new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-test", "secretTtlSeconds", 300));
+        GcpConfig config = new GcpConfig(Map.of("enabled", true, "projectId", "example-project", "secretTtlSeconds", 300));
         GcpSecretsElHolder holder = new GcpSecretsElHolder(new CachingGcpSecretResolver(client, config, CLOCK));
 
         TemplateEngine engine = TemplateEngine.templateEngine();

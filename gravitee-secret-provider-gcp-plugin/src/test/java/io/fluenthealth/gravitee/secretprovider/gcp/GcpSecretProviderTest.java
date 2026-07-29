@@ -62,7 +62,7 @@ class GcpSecretProviderTest {
     }
 
     private static GcpConfig config(Map<String, Object> overrides) {
-        Map<String, Object> conf = new java.util.HashMap<>(Map.of("enabled", true, "projectId", "fh-apim-test"));
+        Map<String, Object> conf = new java.util.HashMap<>(Map.of("enabled", true, "projectId", "example-project"));
         conf.putAll(overrides);
         return new GcpConfig(conf);
     }
