@@ -34,7 +34,17 @@ import org.junit.jupiter.api.Test;
 
 class GcpSecretsElHolderTest {
 
-    private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-07-29T12:00:00Z"), ZoneOffset.UTC);
+    /*
+     * A system clock, deliberately, not a fixed one. The cache decides staleness with
+     * SecretMap#isExpired, which compares against Instant.now() and takes no injected clock — so a
+     * clock fixed at some instant T makes every cache entry expire in wall-clock terms once the real
+     * time passes T + ttl. A fixed 2026-07-29T12:00:00Z with the 300s TTL below did exactly that:
+     * green all morning, then failing from 12:05Z onwards. A time bomb, not a flake.
+     *
+     * Tests that need an entry to be expired stamp their own clock in the past instead — see
+     * should_refetch_once_the_ttl_has_lapsed_so_a_rotation_is_picked_up.
+     */
+    private static final Clock CLOCK = Clock.systemUTC();
     private static final GcpConfig CONFIG = new GcpConfig(Map.of("enabled", true, "projectId", "fh-apim-test", "secretTtlSeconds", 300));
 
     private final List<String> requested = new ArrayList<>();
