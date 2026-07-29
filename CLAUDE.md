@@ -1,0 +1,1 @@
+See [AGENTS.md](./AGENTS.md) for repo-specific agent guidance. Read it before changing how the EL shim registers itself or bumping the target APIM version — it records facts about the gateway's secrets/EL internals that were established by inspecting the shipped jars and are not documented anywhere upstream.

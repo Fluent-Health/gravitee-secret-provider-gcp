@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    Copyright © 2026 Fluent Health (https://fluentinhealth.com)
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.gravitee</groupId>
+        <artifactId>gravitee-parent</artifactId>
+        <version>24.0.2</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>io.fluenthealth.gravitee.secretprovider</groupId>
+    <artifactId>gravitee-secret-provider-gcp-project</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>Fluent Health - Gravitee Secret Provider - GCP</name>
+    <description>Load Gravitee APIM secrets directly from GCP Secret Manager</description>
+    <inceptionYear>2026</inceptionYear>
+
+    <modules>
+        <!-- The only GCP-aware code. Shared by the plugin and the EL shim. -->
+        <module>gravitee-secret-provider-gcp-core</module>
+        <!-- The secret-provider plugin (ZIP), for `secret://gcp/...` references. -->
+        <module>gravitee-secret-provider-gcp-plugin</module>
+        <!-- Mode A2: the OSS EL shim (JAR for lib/ext), for `{#secrets.get(...)}`. -->
+        <module>gravitee-secret-provider-gcp-el</module>
+    </modules>
+
+    <properties>
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!--
+          Pinned to the versions shipped by APIM 4.12.12. Every Gravitee/third-party
+          dependency below is `provided` — the gateway supplies it at runtime — so these
+          must track the target APIM release or the plugin will fail with NoSuchMethodError
+          at request time rather than at startup. After any APIM bump, re-read them off the
+          image itself (see AGENTS.md), never guess — the command is in AGENTS.md under
+          "Reading the runtime versions off the image".
+
+          Note gravitee-secret-api is 3.0.0, NOT the 1.0.0 that the OSS Kubernetes
+          provider compiles against. The plugin SPI (SecretProvider, SecretMap, SecretURL,
+          SecretManagerConfiguration) is unchanged between the two, which is why that
+          provider still runs here — but the EL-facing types are not: in 3.0.0
+          EvaluatedSecretsMethods#fromEL/#fromGrant return Single<String> rather than
+          String. The EL shim therefore requires 3.0.0.
+        -->
+        <gravitee-secret-api.version>3.0.0</gravitee-secret-api.version>
+        <gravitee-expression-language.version>4.4.0</gravitee-expression-language.version>
+        <gravitee-node.version>9.4.0</gravitee-node.version>
+        <!-- APIM 4.12 is on Vert.x 5. Declared explicitly so the compile-time major can
+             never silently diverge from the gateway's. -->
+        <vertx.version>5.0.12</vertx.version>
+        <rxjava.version>3.1.12</rxjava.version>
+        <spring.version>6.2.18</spring.version>
+        <guava.version>33.4.5-jre</guava.version>
+        <slf4j.version>2.0.18</slf4j.version>
+
+        <!-- Test-only -->
+        <junit-jupiter.version>5.11.4</junit-jupiter.version>
+        <assertj.version>3.27.7</assertj.version>
+        <mockito.version>5.14.2</mockito.version>
+        <wiremock.version>3.9.2</wiremock.version>
+        <testcontainers.version>1.21.4</testcontainers.version>
+        <awaitility.version>4.2.2</awaitility.version>
+        <logback.version>1.5.16</logback.version>
+
+        <!--
+          gravitee-parent's ArchUnit rules encode conventions internal to the Gravitee codebase:
+          `global-logging-check` bans SLF4J's LoggerFactory (directly or via Lombok's @Slf4j) in
+          favour of Gravitee's own logging facade, and `execution-context-logging-check` expects
+          `ctx.withLogger(log)`. Neither facade is part of the plugin SPI this project compiles
+          against, and the gateway ships slf4j-api precisely so plugins can log through it — the OSS
+          Kubernetes secret provider does the same. So: SLF4J, and this rule set off.
+        -->
+        <gravitee.archrules.skip>true</gravitee.archrules.skip>
+
+        <maven-assembly-plugin.version>3.7.1</maven-assembly-plugin.version>
+        <maven-failsafe-plugin.version>3.5.5</maven-failsafe-plugin.version>
+        <properties-maven-plugin.version>1.2.1</properties-maven-plugin.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.gravitee.secret</groupId>
+                <artifactId>gravitee-secret-api</artifactId>
+                <version>${gravitee-secret-api.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.gravitee.el</groupId>
+                <artifactId>gravitee-expression-language</artifactId>
+                <version>${gravitee-expression-language.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.gravitee.node</groupId>
+                <artifactId>gravitee-node-secrets-config</artifactId>
+                <version>${gravitee-node.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.vertx</groupId>
+                <artifactId>vertx-core</artifactId>
+                <version>${vertx.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.vertx</groupId>
+                <artifactId>vertx-web-client</artifactId>
+                <version>${vertx.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.vertx</groupId>
+                <artifactId>vertx-rx-java3</artifactId>
+                <version>${vertx.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.reactivex.rxjava3</groupId>
+                <artifactId>rxjava</artifactId>
+                <version>${rxjava.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework</groupId>
+                <artifactId>spring-context</artifactId>
+                <version>${spring.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>${guava.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>${slf4j.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.junit</groupId>
+                <artifactId>junit-bom</artifactId>
+                <version>${junit-jupiter.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.assertj</groupId>
+                <artifactId>assertj-core</artifactId>
+                <version>${assertj.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.mockito</groupId>
+                <artifactId>mockito-junit-jupiter</artifactId>
+                <version>${mockito.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.wiremock</groupId>
+                <artifactId>wiremock</artifactId>
+                <version>${wiremock.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.awaitility</groupId>
+                <artifactId>awaitility</artifactId>
+                <version>${awaitility.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.qos.logback</groupId>
+                <artifactId>logback-classic</artifactId>
+                <version>${logback.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Every module tests with the same stack. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>com.mycila</groupId>
+                    <artifactId>license-maven-plugin</artifactId>
+                    <configuration>
+                        <!-- Inherited from gravitee-parent, but the copyright is ours. -->
+                        <properties>
+                            <owner>Fluent Health</owner>
+                            <email>https://fluentinhealth.com</email>
+                        </properties>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <!-- `release` rather than source/target: the JDK then also refuses
+                         references to APIs newer than 21, which source/target does not. -->
+                    <release>${maven.compiler.release}</release>
+                    <proc>none</proc>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

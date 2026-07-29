@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    Copyright © 2026 Fluent Health (https://fluentinhealth.com)
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.fluenthealth.gravitee.secretprovider</groupId>
+        <artifactId>gravitee-secret-provider-gcp-project</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>gravitee-secret-provider-gcp-el</artifactId>
+    <name>Fluent Health - Gravitee Secret Provider - GCP - EL shim</name>
+    <description>Mode A2: resolves {#secrets.get('/gcp/...')} in API definitions without a licence</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.fluenthealth.gravitee.secretprovider</groupId>
+            <artifactId>gravitee-secret-provider-gcp-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!--
+          gravitee-secret-api 3.0.0 specifically: DeferredFunctionHolder and the Single-returning
+          EvaluatedSecretsMethods signatures only exist from 2.x on. See the note in the root POM.
+        -->
+        <dependency>
+            <groupId>io.gravitee.secret</groupId>
+            <artifactId>gravitee-secret-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.gravitee.el</groupId>
+            <artifactId>gravitee-expression-language</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-context</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <!--
+          For PluginHandler, which is only used as the spring.factories key that gets this class
+          registered as a bean at all. See the deployment note in AGENTS.md.
+        -->
+        <dependency>
+            <groupId>io.gravitee.plugin</groupId>
+            <artifactId>gravitee-plugin-core</artifactId>
+            <version>5.1.5</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-core</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-web-client</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-rx-java3</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.reactivex.rxjava3</groupId>
+            <artifactId>rxjava</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+          Only needed to evaluate expressions in tests. EL's built-in `/whitelist` resource names
+          methods whose parameter types live in these jars, and SecuredResolver.initialize() loads
+          the whole file eagerly. A missing class there surfaces as NoClassDefFoundError, which its
+          per-declaration try/catch does not catch, so the whole whitelist fails to load. Versions
+          match what APIM 4.12.12 ships in lib/ext.
+        -->
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcpkix-jdk18on</artifactId>
+            <version>1.84</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.gravitee.gateway</groupId>
+            <artifactId>gravitee-gateway-api</artifactId>
+            <version>6.3.0</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+          The gateway integration tests mount the built plugin ZIP into a real gateway.
+          Declared as a dependency rather than reached for at
+          ../gravitee-secret-provider-gcp-plugin/target/ so the reactor is obliged to
+          build it first, and so the path is resolved by Maven rather than guessed.
+        -->
+        <dependency>
+            <groupId>io.fluenthealth.gravitee.secretprovider</groupId>
+            <artifactId>gravitee-secret-provider-gcp</artifactId>
+            <version>${project.version}</version>
+            <type>zip</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <profiles>
+        <!--
+          Both integration profiles are opt-in so a bare `mvn verify` stays fast and
+          needs neither Docker nor GCP.
+
+          -Pintegration-test        real gateway, Google endpoints stubbed. Needs Docker.
+          -Pgcloud-integration-test real gateway, real GCP Secret Manager. Needs Docker
+                                    and credentials for the CI service account.
+        -->
+        <profile>
+            <id>integration-test</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>${maven-failsafe-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <includes>
+                                <include>**/*IT.java</include>
+                            </includes>
+                            <groups>gateway-integration</groups>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>gcloud-integration-test</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>${maven-failsafe-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <includes>
+                                <include>**/*IT.java</include>
+                            </includes>
+                            <groups>gcloud-integration</groups>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

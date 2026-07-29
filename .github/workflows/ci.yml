@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# Least privilege by default; jobs opt into more only if they need it.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: maven
+
+      # `verify` also runs prettier:check and license:check, both bound to `validate` by
+      # gravitee-parent, so formatting and licence headers gate the build.
+      - name: Verify (lint, licence headers, tests)
+        run: mvn verify --batch-mode
+
+      - name: Build artifacts
+        run: mvn package -DskipTests -Dskip.validation=true --batch-mode
+
+      # Boots a real gateway with both artifacts installed. Needs Docker but no GCP, so it runs on
+      # every PR including from forks. This is what guards the gateway-internal contracts —
+      # classloader placement, the spring.factories key, and secret-provider config discovery.
+      - name: Gateway integration test
+        run: mvn verify -Pintegration-test -Dskip.validation=true --batch-mode
+
+      # The secret-provider plugin, for plugins/.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plugin-zip
+          path: gravitee-secret-provider-gcp-plugin/target/gravitee-secret-provider-gcp-*.zip
+          retention-days: 7
+
+      # The EL shim and the core jar it needs beside it. Both go in lib/ — NOT lib/ext/,
+      # which cannot see gravitee-expression-language. See AGENTS.md.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: el-shim-jars
+          path: |
+            gravitee-secret-provider-gcp-el/target/gravitee-secret-provider-gcp-el-*.jar
+            gravitee-secret-provider-gcp-core/target/gravitee-secret-provider-gcp-core-*.jar
+          retention-days: 7
+
+  # Resolves the real synthetic secret out of the real GCP Secret Manager. Separate job because it
+  # needs Workload Identity Federation, which a fork PR cannot obtain: GitHub does not grant
+  # `id-token: write` to workflows triggered from a fork, so this is skipped there rather than
+  # failing confusingly for external contributors.
+  live-gcp:
+    needs: build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Build artifacts
+        run: mvn install -DskipTests -Dskip.validation=true --batch-mode
+
+      # Auth deliberately comes AFTER any step that runs prettier: the action writes a
+      # gha-creds-*.json into the working directory, and prettier scans the working directory and
+      # fails on it. `-Dskip.validation=true` above is belt and braces for the same reason.
+      #
+      # token_format: access_token because the plugin has no Google auth library and cannot consume
+      # the external_account credential file that WIF hands over by default.
+      - uses: google-github-actions/auth@v3
+        id: auth
+        with:
+          workload_identity_provider: ${{ vars.GHA_WIF_PROVIDER }}
+          service_account: ${{ vars.GHA_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Live GCP Secret Manager test
+        run: mvn verify -Pgcloud-integration-test -Dskip.validation=true --batch-mode
+        env:
+          GCP_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}

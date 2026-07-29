@@ -1,0 +1,20 @@
+#
+# This registers GcpSecretsTemplateVariableProvider as a bean in the gateway's MAIN application
+# context, which is the only reason it is ever discovered.
+#
+# The obvious-looking key, `io.gravitee.el.TemplateVariableProvider`, is DEAD in APIM 4.12.12:
+# nothing reads it. The one declaration of it in the gateway (gravitee-apim-gateway-reactor) is
+# vestigial — NodeTemplateVariableProvider actually becomes a bean through an @Bean method in
+# ReactorConfiguration, and it has a two-argument constructor no factories loader could satisfy.
+# Declaring our provider under that key gets it silently ignored.
+#
+# The keys that ARE read by a SpringFactoriesLoader that registers beans:
+#   io.gravitee.plugin.core.api.PluginHandler       -> main context   (used here)
+#   io.gravitee.node.container.ContainerInitializer -> boot context
+#
+# PluginHandler is chosen because the main context is where the EL machinery lives; the boot context
+# holds only Configuration/Environment and the secret plugin manager. We are not really a plugin
+# handler — canHandle() returns false — the interface is purely the registration hook.
+#
+io.gravitee.plugin.core.api.PluginHandler=\
+    io.fluenthealth.gravitee.secretprovider.gcp.el.GcpSecretsTemplateVariableProvider

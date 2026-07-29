@@ -1,0 +1,17 @@
+target/
+.idea/
+*.iml
+.DS_Store
+node_modules/
+
+# Credentials — never commit
+.env
+*.pem
+*.key
+*.p12
+*.pfx
+service-account*.json
+*-sa-key.json
+
+# Written into the workdir by google-github-actions/auth; prettier scans the workdir.
+gha-creds-*.json
