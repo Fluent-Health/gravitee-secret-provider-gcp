@@ -38,8 +38,21 @@ jobs:
               -DnewVersion=${{ steps.version.outputs.version }} \
               -DgenerateBackupPoms=false
 
-      - name: Verify (lint, licence headers, tests)
-        run: mvn verify --batch-mode
+      # -Pintegration-test boots a real gateway with the artifacts this release will publish and
+      # checks it accepts them: the shim jar's classloader placement, the spring.factories key that
+      # makes it a bean, and secret-provider configuration-class discovery. All three are
+      # gateway-internal contracts that the unit tests cannot reach, and all three have been broken
+      # at some point — so a release must not be cut without them. Needs Docker, which the
+      # GitHub-hosted runner has.
+      #
+      # Note the profile also packages, so the artifacts exist after this step; the explicit build
+      # below is kept only to make the artifact paths obvious to the upload step.
+      #
+      # The live-GCP profile is deliberately NOT run here: it needs Workload Identity, and granting
+      # the release job `id-token: write` to re-test what CI already covered on the same commit is a
+      # worse trade than leaving it to CI.
+      - name: Verify (lint, licence headers, unit + gateway integration tests)
+        run: mvn verify -Pintegration-test --batch-mode
 
       - name: Build artifacts
         run: mvn package -DskipTests -Dskip.validation=true --batch-mode
