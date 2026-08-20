@@ -18,6 +18,7 @@ apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
   name: gravitee-secret-provider-gcp
+  title: Gravitee APIM GCP Secret Provider
   description: Gravitee APIM secret-provider plugin resolving secrets from GCP Secret Manager, with an OSS expression-language shim.
   annotations:
     github.com/project-slug: Fluent-Health/gravitee-secret-provider-gcp
