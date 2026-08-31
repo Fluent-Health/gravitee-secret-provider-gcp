@@ -61,12 +61,13 @@ import org.testcontainers.utility.MountableFile;
  * {@code *.json} in a watched directory. No MongoDB and no management API are required. See
  * AGENTS.md ("Not yet done") for the file format.
  *
- * <h2>Two corrections worth reading before trusting this class</h2>
+ * <h2>Why this asserts on the shim's own startup line</h2>
  *
- * <p><b>The assertion that the logs mention the provider class does not prove initialisation.</b> It
+ * <p>It used to assert that the logs <em>mention</em> the provider class, which proved nothing: that
  * is satisfied by {@code AbstractPluginHandlerBeanRegistryPostProcessor} <em>listing</em> the class
- * name while registering its bean definition. A test that reads as "the shim initialised" while only
- * proving "a bean definition was registered" is worse than no test, so treat it as the latter.
+ * name while registering its bean definition. It read as "the shim initialised" while proving only
+ * "a bean definition was registered" — and that gap is how the wrong claim below survived. It now
+ * asserts on the shim's own "active" line, which only {@code afterPropertiesSet} can emit.
  *
  * <p><b>The beans <em>are</em> instantiated at startup.</b> This comment previously said
  * {@code TemplateVariableProvider} beans are resolved lazily at first API deployment, so with no API
@@ -108,6 +109,7 @@ class GcpGatewayBootstrapIT {
             "/opt/graviteeio-gateway/lib/gravitee-secret-provider-gcp-core.jar"
         )
         .withCopyFileToContainer(MountableFile.forHostPath(graviteeYml()), "/opt/graviteeio-gateway/config/gravitee.yml")
+        .withCopyFileToContainer(MountableFile.forHostPath(logbackXml()), "/opt/graviteeio-gateway/config/logback.xml")
         .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("gateway"))
         .waitingFor(Wait.forLogMessage(".*Gravitee\\.io - API Gateway .* started in .*\\n", 1))
         .withStartupTimeout(Duration.ofMinutes(3));
@@ -119,8 +121,8 @@ class GcpGatewayBootstrapIT {
         assertThat(gateway.isRunning()).isTrue();
 
         assertThat(logs)
-            .as("the EL shim must be registered as a plugin handler — that is what makes it a Spring bean at all")
-            .contains(PROVIDER_CLASS);
+            .as("the shim must actually INITIALISE, which only its own startup line proves")
+            .contains("GCP secrets EL shim active");
 
         assertThat(logs)
             .as("the shim jar must not be loaded by a classloader that cannot see gravitee-expression-language")
@@ -174,6 +176,39 @@ class GcpGatewayBootstrapIT {
         throw new IllegalStateException(
             "No artifact matching '%s' in %s. Run `mvn package` first.".formatted(glob, target.toAbsolutePath())
         );
+    }
+
+    /**
+     * The gateway's shipped {@code logback.xml} raises {@code io.gravitee} to {@code INFO} and leaves
+     * {@code <root level="WARN">}, so every {@code log.info} from this jar's {@code io.fluenthealth}
+     * package is discarded. Without this override the shim's own startup lines never appear, and any
+     * assertion that looks for them measures nothing — which is exactly the trap described in the
+     * class comment.
+     */
+    private static Path logbackXml() {
+        String xml = """
+            <configuration>
+                <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+                    <encoder>
+                        <pattern>%d{HH:mm:ss.SSS} [%thread] [%X{api}] %-5level %logger{36} - %msg%n</pattern>
+                    </encoder>
+                </appender>
+                <logger name="io.gravitee" level="INFO" />
+                <logger name="com.graviteesource" level="INFO" />
+                <logger name="io.fluenthealth" level="DEBUG" />
+                <logger name="org.springframework" level="WARN" />
+                <root level="WARN">
+                    <appender-ref ref="STDOUT" />
+                </root>
+            </configuration>
+            """;
+        try {
+            Path file = Files.createTempDirectory("gcp-secret-logback").resolve("logback.xml");
+            Files.writeString(file, xml);
+            return file;
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not write logback.xml", e);
+        }
     }
 
     private static Path graviteeYml() {

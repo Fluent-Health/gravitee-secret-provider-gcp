@@ -101,14 +101,36 @@ public class GcpSecretsTemplateVariableProvider
         GcpConfig config = GcpElConfigReader.read(environment);
         boolean elEnabled = environment.getProperty(EL_ENABLED_PROPERTY, Boolean.class, false);
 
+        if (!config.isEnabled() && !elEnabled) {
+            /*
+             * Both switches off is a deliberate opt-out — mode A2 is opt-in and the jar is designed
+             * to sit inert until someone asks for it. DEBUG, so a gateway that never wanted the shim
+             * carries no noise about it.
+             */
+            log.debug("GCP secrets EL shim inactive: both secrets.gcp.enabled and {} are false.", EL_ENABLED_PROPERTY);
+            return;
+        }
+
         if (!config.isEnabled() || !elEnabled) {
-            // INFO, not DEBUG: if someone expected #secrets to work, the reason it does not has to
-            // be visible in a normal gateway log rather than requiring a restart at debug level.
-            log.info(
-                "GCP secrets EL shim INACTIVE (secrets.gcp.enabled={}, {}={}); '#secrets' is not registered by this jar.",
+            /*
+             * WARN because that is the honest severity, not because of any log level it happens to
+             * clear: one switch on and the other off cannot be what anyone meant, and the result is
+             * a jar installed in lib/ doing nothing while '#secrets' expressions fail at request
+             * time. Naming the switch to flip is the whole value of the line.
+             *
+             * Deliberately not a startup failure. SecretsModeExclusivity does throw for the
+             * enterprise-service clash, but that is a different problem: there, two providers
+             * register the same variable and something silently picks a winner. Here nothing is
+             * ambiguous, and a gateway that refuses to boot is a worse outcome than one that logs
+             * why a secret is not resolving. Considered and declined.
+             */
+            log.warn(
+                "GCP secrets EL shim NOT ACTIVE because its two switches disagree: secrets.gcp.enabled={}, {}={}. " +
+                    "'#secrets' is not registered by this jar, so every expression using it will fail. Set {} to true.",
                 config.isEnabled(),
                 EL_ENABLED_PROPERTY,
-                elEnabled
+                elEnabled,
+                config.isEnabled() ? EL_ENABLED_PROPERTY : "secrets.gcp.enabled"
             );
             return;
         }
