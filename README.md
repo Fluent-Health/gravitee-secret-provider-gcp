@@ -157,6 +157,16 @@ Bearer {#secrets.get('/gcp/api-token:token')}
 {#secrets.get('/gcp/db-credentials', 'password')}
 ```
 
+### Raise this jar's log level, or you will not see why it failed
+
+The gateway's shipped `logback.xml` sets `io.gravitee` to `INFO` and leaves `<root level="WARN">`. Nothing raises `io.fluenthealth`, so **every `INFO` line this plugin logs is discarded** — including the confirmation that the shim activated and the reminder about the whitelist entries. Add:
+
+```xml
+<logger name="io.fluenthealth" level="INFO" />
+```
+
+Without it you still get the important failure: a configuration where `secrets.gcp.enabled` and `secrets.gcp.el.enabled` disagree logs at `WARN` and survives the default root level, naming the switch to flip. What you lose is the positive confirmation, so add the logger when first wiring this up.
+
 ### Why the whitelist entries are mandatory
 
 Gravitee's expression language refuses to call any method that is not on an allow-list (`SecuredResolver`, loaded from a `whitelist` classpath resource plus `el.whitelist.list`). The built-in list covers `EvaluatedSecretsMethods#get`, which returns a plain `String` — and a `String` return means resolving a secret would have to **block the event loop**.
