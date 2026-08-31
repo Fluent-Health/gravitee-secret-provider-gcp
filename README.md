@@ -138,7 +138,7 @@ Resolved once, at startup.
 
 ## Mode A2 — API definitions, no licence
 
-Also install the EL shim jar (and the core jar) into `lib/`, set `secrets.gcp.el.enabled: true`, **and add two whitelist entries**:
+Also install the EL shim jar (and the core jar) into `lib/`, set `secrets.gcp.el.enabled: true`, **and add three whitelist entries**:
 
 ```yaml
 el:
@@ -147,6 +147,7 @@ el:
     list:
       - method io.fluenthealth.gravitee.secretprovider.gcp.el.GcpSecretsElHolder get java.lang.String
       - method io.fluenthealth.gravitee.secretprovider.gcp.el.GcpSecretsElHolder get java.lang.String java.lang.String
+      - method io.fluenthealth.gravitee.secretprovider.gcp.el.GcpSecretsElHolder basic java.lang.String java.lang.String
 ```
 
 Then, in any API definition:
@@ -155,7 +156,32 @@ Then, in any API definition:
 {#secrets.get('/gcp/db-credentials:password')}
 Bearer {#secrets.get('/gcp/api-token:token')}
 {#secrets.get('/gcp/db-credentials', 'password')}
+{#secrets.basic('/gcp/db-credentials:password', 'apim')}
 ```
+
+### Basic-auth headers: use `#secrets.basic(...)`
+
+`#secrets.basic('<uri>', '<username>')` returns a finished credential — `Basic base64(username:secret)` — ready to be a header value:
+
+```
+{#secrets.basic('/gcp/db-credentials:password', 'apim')}
+```
+
+Reach for it rather than assembling the header in the expression language, because **the obvious composition is silently broken**:
+
+```
+# DO NOT USE — sends expression fragments upstream, with no error
+Basic {T(java.util.Base64).getEncoder().encodeToString(('apim:' + #secrets.get('/gcp/s:value')).getBytes())}
+```
+
+Gravitee hoists each sub-expression that touches a deferred variable into a synthetic variable resolved before the surrounding expression, but it rebuilds that sub-expression as *text* from the SpEL AST, and `CachedExpression` never collects the `T(java.util.Base64)` node — so the hoisted text loses its receiver. When the whole value is that one expression the malformed fragment is discarded again and it happens to work. Add any literal text around it, such as the mandatory `Basic ` prefix, and it is substituted in instead: the header goes upstream carrying expression fragments, the far end answers `401`, and nothing is logged.
+
+Two related traps in the same area, neither specific to secrets:
+
+- **An expression must open with `#`, `T` or `(`.** `SpelExpressionParser` only rewrites those three forms into its `{#` prefix, so `{'apim:' + #secrets.get('/gcp/s:value')}` is not an expression at all — the braces and the reference are sent verbatim as literal text.
+- **A bare holder call is safe anywhere**, including inside a larger string: `Bearer {#secrets.get('/gcp/api-token:token')}` works. It is composition *around* the call, not surrounding literal text, that breaks.
+
+Unlike `get`, `basic` has no enterprise equivalent, so a definition using it is **not** licence-portable — see [Switching between A2 and B](#switching-between-a2-and-b). Note also that a missing whitelist entry for `basic` fails *loudly*, as an evaluation error, rather than silently like the composition above.
 
 ### Why the whitelist entries are mandatory
 
@@ -189,7 +215,9 @@ Two things worth knowing:
 
 ## Switching between A2 and B
 
-No API definition changes. The shim registers the EL variable `secrets` with the same `get` signatures and the same URI syntax as the enterprise plugin.
+No API definition changes, with one exception. The shim registers the EL variable `secrets` with the same `get` signatures and the same URI syntax as the enterprise plugin.
+
+> **`#secrets.basic(...)` is ours alone.** The enterprise plugin does not provide it, so any definition using it has to be rewritten before switching to mode B — with `clientAuthMethod`-style support in the policy, or by composing the header in the enterprise EL, where the deferral bug above does not apply. Grep for `secrets.basic` before switching.
 
 - **A2 → B:** install the enterprise `service-secrets` plugin, set `secrets.gcp.el.enabled: false`. Keep the secret-provider ZIP — mode B still resolves *through* it.
 - **B → A2:** remove the enterprise plugin, set `secrets.gcp.el.enabled: true`, add the whitelist entries.

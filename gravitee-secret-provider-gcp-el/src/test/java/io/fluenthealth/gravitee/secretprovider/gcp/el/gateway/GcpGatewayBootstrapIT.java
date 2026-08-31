@@ -127,6 +127,27 @@ class GcpGatewayBootstrapIT {
             .doesNotContain("No secret-provider plugin found for provider id: 'gcp'");
     }
 
+    /**
+     * The whitelist entries a deployment has to configure are the ones in {@link #graviteeYml()}, so
+     * assert the gateway actually accepted them.
+     *
+     * <p>This is not covered by the gateway simply starting. {@code SecuredResolver} catches a bad
+     * declaration per entry and only logs a warning — and per AGENTS.md a declaration naming a type
+     * the gateway cannot load raises {@code NoClassDefFoundError}, which that {@code catch} does not
+     * catch, taking the <em>entire</em> whitelist down. Either way the gateway starts clean and every
+     * {@code #secrets} expression then fails at request time.
+     */
+    @Test
+    void should_accept_every_whitelist_declaration_a_deployment_must_configure() {
+        String logs = gateway.getLogs();
+
+        assertThat(logs)
+            .as("a rejected declaration is only a warning at startup, and a silent 500 per request afterwards")
+            .doesNotContain("cannot be loaded");
+
+        assertThat(logs).as("one unloadable parameter type takes the whole whitelist with it").doesNotContain("built-in whitelist");
+    }
+
     /** Locates an artifact built by the reactor. */
     private static Path artifact(String moduleDir, String glob) {
         Path target = Path.of("..", moduleDir, "target");
@@ -185,7 +206,8 @@ class GcpGatewayBootstrapIT {
                 list:
                   - method %s get java.lang.String
                   - method %s get java.lang.String java.lang.String
-            """.formatted(HOLDER_CLASS, HOLDER_CLASS);
+                  - method %s basic java.lang.String java.lang.String
+            """.formatted(HOLDER_CLASS, HOLDER_CLASS, HOLDER_CLASS);
         try {
             Path file = Files.createTempDirectory("gcp-secret-bootstrap").resolve("gravitee.yml");
             Files.writeString(file, yml);

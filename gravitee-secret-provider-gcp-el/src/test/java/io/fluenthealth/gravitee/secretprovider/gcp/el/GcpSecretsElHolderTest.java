@@ -27,6 +27,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -200,5 +201,122 @@ class GcpSecretsElHolderTest {
         GcpSecretsElHolder holder = holderReturning("x");
 
         holder.get("  ").test().awaitDone(5, TimeUnit.SECONDS).assertError(SecretManagerException.class);
+    }
+
+    // ── basic() ──────────────────────────────────────────────────────────────
+
+    @Test
+    void should_build_a_complete_basic_credential_from_the_resolved_secret() {
+        GcpSecretsElHolder holder = holderReturning("s3cr3t");
+
+        String value = holder
+            .basic("/gcp/emr-bots-client-secret:value", "emr-bots")
+            .test()
+            .awaitDone(5, TimeUnit.SECONDS)
+            .assertComplete()
+            .values()
+            .getFirst();
+
+        assertThat(value).isEqualTo("Basic " + Base64.getEncoder().encodeToString("emr-bots:s3cr3t".getBytes(StandardCharsets.UTF_8)));
+        assertThat(value).isEqualTo("Basic ZW1yLWJvdHM6czNjcjN0");
+        assertThat(requested).containsExactly("emr-bots-client-secret/latest");
+    }
+
+    @Test
+    void should_read_the_password_out_of_a_json_secret_by_key() {
+        GcpSecretsElHolder holder = holderReturning("{\"username\":\"ignored\",\"password\":\"s3cr3t\"}");
+
+        String value = holder
+            .basic("/gcp/db-credentials:password", "apim")
+            .test()
+            .awaitDone(5, TimeUnit.SECONDS)
+            .assertComplete()
+            .values()
+            .getFirst();
+
+        assertThat(value).isEqualTo("Basic " + Base64.getEncoder().encodeToString("apim:s3cr3t".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /**
+     * The platform default charset would make the header depend on the gateway's locale, so a
+     * non-ASCII password could encode differently from one node to the next.
+     */
+    @Test
+    void should_encode_the_credential_as_utf8_regardless_of_the_platform_default() {
+        GcpSecretsElHolder holder = holderReturning("pä§§word-€");
+
+        String value = holder
+            .basic("/gcp/unicode-secret:value", "üser")
+            .test()
+            .awaitDone(5, TimeUnit.SECONDS)
+            .assertComplete()
+            .values()
+            .getFirst();
+
+        assertThat(value).isEqualTo("Basic " + Base64.getEncoder().encodeToString("üser:pä§§word-€".getBytes(StandardCharsets.UTF_8)));
+        assertThat(Base64.getDecoder().decode(value.substring("Basic ".length()))).isEqualTo(
+            "üser:pä§§word-€".getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
+    /**
+     * RFC 7617, not RFC 6749 §2.3.1: the components are joined verbatim. Encoding them here would
+     * silently corrupt every existing Basic header whose password contains a reserved character.
+     */
+    @Test
+    void should_not_url_encode_the_components() {
+        GcpSecretsElHolder holder = holderReturning("secret:with/slash+plus space");
+
+        String value = holder
+            .basic("/gcp/reserved-chars:value", "id with space")
+            .test()
+            .awaitDone(5, TimeUnit.SECONDS)
+            .assertComplete()
+            .values()
+            .getFirst();
+
+        String decoded = new String(Base64.getDecoder().decode(value.substring("Basic ".length())), StandardCharsets.UTF_8);
+        assertThat(decoded).isEqualTo("id with space:secret:with/slash+plus space");
+    }
+
+    @Test
+    void should_reject_a_blank_user_name_rather_than_send_half_a_credential() {
+        GcpSecretsElHolder holder = holderReturning("s3cr3t");
+
+        holder.basic("/gcp/db-credentials:password", "  ").test().awaitDone(5, TimeUnit.SECONDS).assertError(SecretManagerException.class);
+        holder.basic("/gcp/db-credentials:password", null).test().awaitDone(5, TimeUnit.SECONDS).assertError(SecretManagerException.class);
+
+        assertThat(requested).as("must fail before reaching Secret Manager").isEmpty();
+    }
+
+    @Test
+    void should_reject_an_empty_uri_naming_basic_in_the_message() {
+        GcpSecretsElHolder holder = holderReturning("x");
+
+        holder
+            .basic("  ", "apim")
+            .test()
+            .awaitDone(5, TimeUnit.SECONDS)
+            .assertError(t -> t.getMessage() != null && t.getMessage().contains("#secrets.basic"));
+    }
+
+    @Test
+    void should_propagate_a_resolution_failure_from_basic() {
+        GcpSecretsElHolder holder = holderReturning("{\"username\":\"apim\"}");
+
+        holder
+            .basic("/gcp/db-credentials:password", "apim")
+            .test()
+            .awaitDone(5, TimeUnit.SECONDS)
+            .assertError(t -> t.getMessage() != null && t.getMessage().contains("db-credentials"));
+    }
+
+    @Test
+    void should_not_touch_secret_manager_until_the_basic_single_is_subscribed_to() {
+        GcpSecretsElHolder holder = holderReturning("s3cr3t");
+
+        holder.basic("/gcp/db-credentials:password", "apim");
+
+        assertThat(requested).isEmpty();
     }
 }

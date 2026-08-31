@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
@@ -68,9 +69,10 @@ class GcpSecretsElEvaluationTest {
     private static final Clock CLOCK = Clock.systemUTC();
     private static final String HOLDER = GcpSecretsElHolder.class.getName();
 
-    /** The two lines that must be present under {@code el.whitelist.list} in {@code gravitee.yml}. */
+    /** The three lines that must be present under {@code el.whitelist.list} in {@code gravitee.yml}. */
     static final String WHITELIST_GET_URI = "method " + HOLDER + " get java.lang.String";
     static final String WHITELIST_GET_URI_AND_KEY = "method " + HOLDER + " get java.lang.String java.lang.String";
+    static final String WHITELIST_BASIC = "method " + HOLDER + " basic java.lang.String java.lang.String";
 
     private static final Set<String> requested = ConcurrentHashMap.newKeySet();
 
@@ -81,6 +83,7 @@ class GcpSecretsElEvaluationTest {
         properties.put(SecuredResolver.EL_WHITELIST_MODE_KEY, SecuredResolver.APPEND_WHITELIST_MODE);
         properties.put(SecuredResolver.EL_WHITELIST_LIST_KEY + "[0]", WHITELIST_GET_URI);
         properties.put(SecuredResolver.EL_WHITELIST_LIST_KEY + "[1]", WHITELIST_GET_URI_AND_KEY);
+        properties.put(SecuredResolver.EL_WHITELIST_LIST_KEY + "[2]", WHITELIST_BASIC);
         environment.getPropertySources().addFirst(new MapPropertySource("whitelist", properties));
         SecuredResolver.initialize(environment);
     }
@@ -166,5 +169,116 @@ class GcpSecretsElEvaluationTest {
         TemplateEngine engine = engineWith("plain-token");
 
         assertThat(engine.evalNow("{#secrets.get('/gcp/el-sync:value')}", Object.class)).isNotInstanceOf(String.class);
+    }
+
+    // ── #secrets.basic(...) ──────────────────────────────────────────────────
+
+    /**
+     * The shape the method exists for: the whole header value is one holder call. This is what an
+     * API definition will actually contain.
+     */
+    @Test
+    void should_resolve_basic_as_a_whole_expression() {
+        TemplateEngine engine = engineWith("s3cr3t");
+
+        String value = eval(engine, "{#secrets.basic('/gcp/el-basic:value', 'emr-bots')}");
+
+        assertThat(value).isEqualTo("Basic " + Base64.getEncoder().encodeToString("emr-bots:s3cr3t".getBytes(StandardCharsets.UTF_8)));
+        assertThat(requested).contains("el-basic");
+    }
+
+    /**
+     * A holder call with literal text around it makes the value a {@code CompositeStringExpression},
+     * the shape that mangles a nested call chain. A bare holder call survives it, so a caller who
+     * wraps the credential in something is still safe.
+     */
+    @Test
+    void should_resolve_basic_with_literal_text_around_it() {
+        TemplateEngine engine = engineWith("s3cr3t");
+
+        String expected = "Basic " + Base64.getEncoder().encodeToString("emr-bots:s3cr3t".getBytes(StandardCharsets.UTF_8));
+
+        assertThat(eval(engine, "<{#secrets.basic('/gcp/el-basic-wrapped:value', 'emr-bots')}>")).isEqualTo("<" + expected + ">");
+    }
+
+    @Test
+    void should_resolve_basic_reading_a_key_out_of_a_json_secret() {
+        TemplateEngine engine = engineWith("{\"username\":\"ignored\",\"password\":\"s3cr3t\"}");
+
+        String value = eval(engine, "{#secrets.basic('/gcp/el-basic-json:password', 'apim')}");
+
+        assertThat(value).isEqualTo("Basic " + Base64.getEncoder().encodeToString("apim:s3cr3t".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void should_surface_a_basic_resolution_failure_as_an_evaluation_error() {
+        TemplateEngine engine = engineWith("{\"username\":\"apim\"}");
+
+        engine
+            .eval("{#secrets.basic('/gcp/el-basic-missing:password', 'apim')}", String.class)
+            .test()
+            .awaitDone(5, TimeUnit.SECONDS)
+            .assertError(throwable -> throwable.getMessage() != null && throwable.getMessage().contains("el-basic-missing"));
+    }
+
+    // ── Why basic(...) exists: the composition it replaces is broken ─────────
+
+    /**
+     * Regression pin for the reason {@link GcpSecretsElHolder#basic} exists at all.
+     *
+     * <p>Building the credential in EL works when the whole value is the one expression — Gravitee's
+     * rewriter happens to discard the malformed sub-expression it built. Nothing about that is
+     * load-bearing; it is asserted only so the contrast with the next test is visible, and so a
+     * change in Gravitee's behaviour shows up here rather than in production.
+     */
+    @Test
+    void composing_the_credential_in_el_works_only_when_it_is_the_entire_value() {
+        TemplateEngine engine = engineWith("s3cr3t");
+
+        String value = eval(
+            engine,
+            "{T(java.util.Base64).getEncoder().encodeToString(('emr-bots:' + #secrets.get('/gcp/el-compose-whole:value')).getBytes())}"
+        );
+
+        assertThat(value).isEqualTo(Base64.getEncoder().encodeToString("emr-bots:s3cr3t".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /**
+     * The outage. Adding the mandatory {@code Basic } prefix makes the value a
+     * {@code CompositeStringExpression}, and Gravitee's textual hoisting drops the
+     * {@code T(java.util.Base64).} receiver from the sub-expression it defers — see
+     * {@code CachedExpression}. The result is neither a credential nor an error: expression
+     * fragments go upstream as the header, and the far end answers 401.
+     *
+     * <p>Asserted as a known-bad behaviour, deliberately. If a future Gravitee release fixes its
+     * rewriter this test fails, which is the signal that {@code basic(...)} could be reconsidered.
+     */
+    @Test
+    void composing_the_credential_in_el_silently_produces_garbage_once_any_literal_is_added() {
+        TemplateEngine engine = engineWith("s3cr3t");
+
+        String value = eval(
+            engine,
+            "Basic {T(java.util.Base64).getEncoder().encodeToString(('emr-bots:' + #secrets.get('/gcp/el-compose-prefixed:value')).getBytes())}"
+        );
+
+        String correct = "Basic " + Base64.getEncoder().encodeToString("emr-bots:s3cr3t".getBytes(StandardCharsets.UTF_8));
+        assertThat(value).as("this is the bug, not the fix").isNotEqualTo(correct);
+        assertThat(value).as("the receiver is dropped and the fragment leaks into the header").contains("encodeToString");
+    }
+
+    /**
+     * The other half of the trap, and the reason a "just concatenate it" workaround is no better: an
+     * expression must open with {@code #}, {@code T} or {@code (} for Gravitee's
+     * {@code SpelExpressionParser} to treat it as one at all. Opening with a quoted literal makes the
+     * whole thing a {@code LiteralExpression} — the braces and the reference are sent verbatim.
+     */
+    @Test
+    void an_expression_opening_with_a_literal_is_not_an_expression_at_all() {
+        TemplateEngine engine = engineWith("s3cr3t");
+
+        String expression = "{'emr-bots:' + #secrets.get('/gcp/el-literal-open:value')}";
+
+        assertThat(eval(engine, expression)).isEqualTo(expression);
     }
 }
