@@ -15,24 +15,15 @@
  */
 package io.fluenthealth.gravitee.secretprovider.gcp.el;
 
-import io.fluenthealth.gravitee.secretprovider.gcp.core.CachingAccessTokenProvider;
-import io.fluenthealth.gravitee.secretprovider.gcp.core.CachingGcpSecretResolver;
-import io.fluenthealth.gravitee.secretprovider.gcp.core.GcpAccessTokenProvider;
 import io.fluenthealth.gravitee.secretprovider.gcp.core.GcpConfig;
-import io.fluenthealth.gravitee.secretprovider.gcp.core.MetadataServerTokenProvider;
-import io.fluenthealth.gravitee.secretprovider.gcp.core.RestGcpSecretManagerClient;
-import io.fluenthealth.gravitee.secretprovider.gcp.core.ServiceAccountKeyTokenProvider;
 import io.gravitee.el.TemplateContext;
 import io.gravitee.el.TemplateVariableProvider;
 import io.gravitee.el.TemplateVariableScope;
 import io.gravitee.el.annotations.TemplateVariable;
 import io.gravitee.plugin.core.api.Plugin;
 import io.gravitee.plugin.core.api.PluginHandler;
-import io.vertx.core.VertxOptions;
-import io.vertx.ext.web.client.WebClientOptions;
 import io.vertx.rxjava3.core.Vertx;
 import io.vertx.rxjava3.ext.web.client.WebClient;
-import java.time.Clock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
@@ -139,21 +130,10 @@ public class GcpSecretsTemplateVariableProvider
         // resolve nondeterministically depending on bean ordering.
         SecretsModeExclusivity.failIfEnterpriseSecretsServicePresent(applicationContext);
 
-        Clock clock = Clock.systemUTC();
-        this.vertx = Vertx.vertx(new VertxOptions().setEventLoopPoolSize(1).setWorkerPoolSize(1));
-        this.webClient = WebClient.create(
-            vertx,
-            new WebClientOptions().setConnectTimeout(config.connectTimeoutMs()).setUserAgent("gravitee-secret-provider-gcp-el")
-        );
-        GcpAccessTokenProvider tokenProvider = new CachingAccessTokenProvider(
-            config.usesMetadataServer()
-                ? new MetadataServerTokenProvider(webClient, config, clock)
-                : new ServiceAccountKeyTokenProvider(webClient, config, clock),
-            clock
-        );
-        this.holder = new GcpSecretsElHolder(
-            new CachingGcpSecretResolver(new RestGcpSecretManagerClient(webClient, config, tokenProvider), config, clock)
-        );
+        GcpResolverFactory.Resolver created = GcpResolverFactory.create(config, "gravitee-secret-provider-gcp-el");
+        this.vertx = created.vertx();
+        this.webClient = created.webClient();
+        this.holder = new GcpSecretsElHolder(created.resolver());
 
         log.info(
             "GCP secrets EL shim active: '#{}.get(\"/gcp/<secret>[/<version>]:<key>\")' resolves from project '{}' " +
