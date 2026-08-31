@@ -99,6 +99,35 @@ sub-expression that touches the holder into a synthetic deferred variable resolv
 surrounding expression is evaluated. `GcpSecretsElEvaluationTest` covers all four composite shapes;
 do not "simplify" it to the bare case.
 
+### The deferral rewrite is textual, and it mangles a nested call chain
+
+The hoisting above is not an AST transformation — `CachedExpression` rebuilds each deferred
+sub-expression by calling `toStringAST()` on a list of collected nodes and then splices it back with
+`String.replaceAll`. Two things follow, both established by evaluating against the real EL 4.4.0 and
+reading its sources:
+
+`computeVariables(CompoundExpression, …)` collects nodes into `deferExpressionNodes` only for
+`VariableReference`, `PropertyOrFieldReference`, `MethodReference` and `Indexer`. A **`TypeReference`
+falls to the `else` branch and is never collected**, so for
+`T(java.util.Base64).getEncoder().encodeToString(… #secrets.get(…) …)` the hoisted text comes out as
+`getEncoder().encodeToString(…)` — receiver gone.
+
+Whether that malformed entry survives depends on the shape of the *whole* value:
+
+| Value | Parses as | Outcome |
+| --- | --- | --- |
+| `{T(…).getEncoder().encodeToString(('id:' + #secrets.get(…)).getBytes())}` | `SpelExpression` | **works** — `computeFinalExpression` removes `lastDeferVariable` because the AST does not start with a `Literal`, discarding the malformed entry |
+| `Basic {T(…)…}` — any literal text around it | `CompositeStringExpression` | **silently wrong** — that branch never runs, the malformed text is spliced in, and expression fragments go upstream as the header value |
+| `Bearer {#secrets.get(…)}` — a bare holder call | `CompositeStringExpression` | works — the two-node compound is collected correctly |
+
+Nothing is logged in the failing case. This is what `GcpSecretsElHolder#basic` exists to avoid, and
+both rows are pinned in `GcpSecretsElEvaluationTest` — including the known-bad one, so a future
+Gravitee fix shows up as a test failure rather than staying invisible.
+
+Separately, `SpelExpressionParser.EXPRESSION_REGEX` only rewrites `{#`, `{T` and `{(` into the `{#`
+parser prefix. **An expression opening with anything else is not an expression**: `{'id:' +
+#secrets.get(…)}` is a `LiteralExpression` and is emitted verbatim, braces and all.
+
 Two further consequences:
 
 - `TemplateEngine.evalNow` / `getValue` bypass the whole mechanism (no `CachedExpression`, no
