@@ -54,15 +54,28 @@ import org.testcontainers.utility.MountableFile;
  *
  * <h2>What this does NOT cover</h2>
  *
- * Request-time resolution of {@code {#secrets.get(...)}}, which needs a deployed API. APIM 4.12 ships
- * no local-registry service plugin — only {@code services-sync}, which reads from a management
- * repository — so an API cannot be loaded from disk, and covering that needs MongoDB plus the
- * management API to create and deploy a V4 API. See AGENTS.md ("Not yet done").
+ * Request-time resolution of {@code {#secrets.get(...)}}, which needs a deployed API. That is not as
+ * expensive as this comment used to claim: APIM 4.12 <em>does</em> ship a local registry
+ * ({@code LocalSyncManager} / {@code LocalApiSynchronizer} in {@code services-sync}, behind
+ * {@code services.sync.local.enabled} and {@code services.sync.local.path}), which deploys every
+ * {@code *.json} in a watched directory. No MongoDB and no management API are required. See
+ * AGENTS.md ("Not yet done") for the file format.
  *
- * <p>Note this is also why nothing here asserts on the shim's own startup logging:
- * {@code ApiTemplateVariableProviderFactory} resolves {@code TemplateVariableProvider} beans lazily,
- * at the first API deployment, so with no API deployed the bean is never instantiated and
- * {@code afterPropertiesSet} never runs. That is expected, not a defect.
+ * <h2>Two corrections worth reading before trusting this class</h2>
+ *
+ * <p><b>The assertion that the logs mention the provider class does not prove initialisation.</b> It
+ * is satisfied by {@code AbstractPluginHandlerBeanRegistryPostProcessor} <em>listing</em> the class
+ * name while registering its bean definition. A test that reads as "the shim initialised" while only
+ * proving "a bean definition was registered" is worse than no test, so treat it as the latter.
+ *
+ * <p><b>The beans <em>are</em> instantiated at startup.</b> This comment previously said
+ * {@code TemplateVariableProvider} beans are resolved lazily at first API deployment, so with no API
+ * deployed the bean is never created and {@code afterPropertiesSet} never runs. That is wrong, and it
+ * was inferred from log lines that were never going to appear: the gateway's default logback keeps
+ * {@code io.fluenthealth} at the {@code WARN} root level, so the shim's own {@code INFO} startup
+ * lines are discarded. Mount a {@code logback.xml} that raises {@code io.fluenthealth} to
+ * {@code INFO} and the shim's "active" line appears on every boot, with no API deployed. Never read
+ * the absence of one of our log lines as evidence about what ran.
  *
  * <p>Run with {@code mvn verify -Pintegration-test}.
  */
