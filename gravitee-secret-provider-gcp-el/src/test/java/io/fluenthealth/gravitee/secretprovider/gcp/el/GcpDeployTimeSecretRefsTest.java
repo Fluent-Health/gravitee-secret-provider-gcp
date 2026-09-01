@@ -223,6 +223,85 @@ class GcpDeployTimeSecretRefsTest {
 
     // ── Nothing is left in place silently ─────────────────────────────────────
 
+    // ── Embedded references: where does a reference end? ──────────────────────
+
+    /**
+     * A reference embedded in a larger value, with path text after it — a {@code dynamic-routing}
+     * rule url.
+     *
+     * <p>The boundary rule is that a reference ends at the last character that could belong to it,
+     * and a trailing {@code /} never can: {@code SecretURL} strips trailing slashes anyway, so one is
+     * always a separator rather than part of the path. Swallowing it would delete a path segment
+     * separator from the url — the value would be right and the route wrong.
+     */
+    @Test
+    void should_stop_a_reference_before_path_text_that_follows_it() {
+        secretValue.set("2f-api-key");
+        TestDefinition definition = new TestDefinition(
+            API_V4,
+            API_ID,
+            configurationWith("{#endpoints['default']}/V1/" + SECRET_REF + "/{#group[0]}")
+        );
+
+        discover(definition, "1");
+
+        assertThat(definition.configuration).contains("{#endpoints['default']}/V1/2f-api-key/{#group[0]}");
+    }
+
+    /**
+     * A reference embedded in a form-encoded body — a {@code policy-assign-content} template.
+     *
+     * <p>{@code &} may only appear inside a query string, so it can only be part of a reference after
+     * a {@code ?}. Treating it as always-part-of-the-reference would eat the parameter separator and
+     * merge two form fields into one, with the correct secret in it — right value, wrong body, no
+     * error. The surrounding {@code $${...}} FreeMarker escape must also survive verbatim.
+     */
+    @Test
+    void should_stop_a_reference_at_a_form_parameter_separator() {
+        secretValue.set("2f-api-key");
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith("apikey=" + SECRET_REF + "&$${request.content}"));
+
+        discover(definition, "1");
+
+        assertThat(definition.configuration).contains("apikey=2f-api-key&$${request.content}");
+    }
+
+    /**
+     * The one embedded shape that is <em>not</em> supported, and the reason it fails loudly instead.
+     *
+     * <p>Once a reference carries a {@code ?}, a following {@code &} is a parameter separator by URL
+     * grammar, so there is no way to tell "end of query string" from "another parameter". The match
+     * absorbs the {@code &}, which yields an empty-named parameter — rejected, rather than silently
+     * eating the separator out of the body.
+     */
+    @Test
+    void should_reject_a_query_string_that_runs_into_the_surrounding_text() {
+        TestDefinition definition = new TestDefinition(
+            API_V4,
+            API_ID,
+            configurationWith("apikey=" + SECRET_REF + "?encoding=base64&$${request.content}")
+        );
+
+        assertThatThrownBy(() -> discover(definition, "1")).hasMessageContaining("unrecognised query parameter");
+    }
+
+    /** A reference that ends the value keeps its query string, which is the ordinary case. */
+    @Test
+    void should_keep_a_query_string_that_ends_the_value() {
+        secretValue.set("2f-api-key");
+
+        TestDefinition definition = deployedWith(SECRET_REF + "?encoding=base64");
+
+        assertThat(definition.configuration).contains(base64("2f-api-key"));
+    }
+
+    @Test
+    void should_reject_a_query_parameter_nobody_reads() {
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith(SECRET_REF + "?encodng=base64"));
+
+        assertThatThrownBy(() -> discover(definition, "1")).hasMessageContaining("encodng");
+    }
+
     /**
      * The incident shape this guards against: a misspelled reference surviving into the deployed
      * definition as literal text, travelling upstream as a credential, and coming back as a 401 that
