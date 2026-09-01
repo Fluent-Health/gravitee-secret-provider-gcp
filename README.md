@@ -271,7 +271,7 @@ The failure this design most wants to avoid is a reference surviving into the de
 | --- | --- |
 | A valid `secret://gcp/...` | Substituted. |
 | A `secret://gcp/...` that cannot be parsed, resolved, or encoded | **The deployment fails**, with an error naming the reference and the plugin whose configuration it was found in. |
-| `secret://<other-provider>/...` | Left alone — this plugin does not own it — but logged at `WARN`, the level that survives the gateway's default `<root level="WARN">` where our `INFO` lines do not. A misspelled provider (`secret://gpc/...`) is the likely cause. |
+| `secret://<other-provider>/...` | Left alone — this plugin does not own it — but logged at `WARN`, so it reaches a default gateway. A misspelled provider (`secret://gpc/...`) is the likely cause. |
 
 This is why the matcher is deliberately generous. A pattern that matched only *valid* references would leave a misspelled one in place, which is exactly the silent case.
 
@@ -307,15 +307,26 @@ Once a `?` is present, a following `&` is a parameter separator by URL grammar a
 
 Unknown query parameters are rejected for the same reason: `SecretURL` silently discards what it does not recognise, so `?encodng=base64` would otherwise be ignored. Only `encoding`, `version`, `keymap` and `watch` are accepted.
 
-### Turn this plugin's logs on, or a substitution that stops happening is invisible
+### The credential lifecycle is logged where you will actually see it
 
-Mode A3 logs each substitution and each retained definition at `INFO` under `io.fluenthealth`, and the gateway's shipped `logback.xml` sets `<root level="WARN">` and raises only `io.gravitee` — so by default **a successful substitution prints nothing at all**. Add:
+**No logging configuration is required.** The gateway's shipped `logback.xml` keeps `<root level="WARN">` and raises only `io.gravitee`, so mode A3 logs the credential lifecycle at `WARN` and it reaches a default gateway as-is:
+
+| Line | When |
+| --- | --- |
+| `GCP deploy-time secret substitution ACTIVE ...` | once, at startup |
+| `Retained N substitution(s) for Definition[kind=api-v4, id=X] revision R` | a credential was injected into a definition |
+| `Released N retained substitution(s) for ...` | a definition was undeployed or superseded |
+| `Publishing VALUE_CHANGED for ...` | a rotation was propagated in place |
+
+`WARN` is not a claim that these are failures. They are audit-shaped rather than routine — each records a plaintext credential being written into, or dropped from, a live API definition that is then readable at `/_node/apis/<id>` — and the failure this feature has to make detectable is substitution **silently stopping**, which leaves a plausible-looking value in place and no error anywhere. A signal that does not survive the default configuration cannot be monitored for at all, not even by its absence. One line per definition, so the volume is one per API per deploy.
+
+Per-*reference* detail stays at `INFO` — `Substituted a gcp reference at <plugin>` and `Secret value changed at <plugin>`. One line per definition is the audit record; one line per field is chatter. To see those, and the `INACTIVE`/`Ignoring REVOKE` diagnostics at `DEBUG`, add:
 
 ```xml
-<logger name="io.fluenthealth" level="INFO" />
+<logger name="io.fluenthealth" level="DEBUG" />
 ```
 
-Then a deploy prints `Substituted a gcp reference at ...` and `Retained N substitution(s) for ...`, and a rotation prints `Publishing VALUE_CHANGED for ...`. Without it the only evidence is indirect — no literal `secret://` left at `/_node/apis/<id>` — and a substitution that silently stopped happening would look exactly like one that never ran. The failure cases above are at `WARN` or are exceptions, so those survive the default level either way.
+`GcpDeployTimeSecretRefsTest` pins both directions, so demoting a lifecycle line or promoting the chatter fails the build.
 
 ### `?encoding=base64`
 

@@ -95,6 +95,24 @@ import org.springframework.core.env.Environment;
  * the two copies then have to be rotated together, nothing about either opaque blob reveals that
  * they have drifted, and the rotation described below would propagate whichever half was updated.
  *
+ * <h2>Log levels are part of the contract</h2>
+ *
+ * The credential lifecycle — <em>injected</em> into a definition, <em>released</em> from one,
+ * <em>rotated</em> in place — is logged at {@code WARN}. Not because those are failures, but because
+ * they are audit-shaped rather than routine: each one records a plaintext credential being written
+ * into, or dropped from, a live API definition that is then readable at {@code /_node/apis/<id>}.
+ *
+ * <p>The practical consequence matters as much as the principle. The gateway's shipped
+ * {@code logback.xml} keeps {@code <root level="WARN">} and raises only {@code io.gravitee}, so an
+ * {@code INFO} line here is discarded in every default deployment — and the failure mode this
+ * feature has to make detectable is substitution <em>silently stopping</em>, which leaves a
+ * plausible-looking value in place and no error anywhere. A signal that does not survive the default
+ * configuration cannot be monitored for at all, not even by its absence.
+ *
+ * <p>Per-<em>reference</em> detail stays at {@code INFO} — one line per definition is the audit
+ * record, one line per field is chatter. {@code GcpDeployTimeSecretRefsTest} pins both directions, so
+ * quietly demoting a lifecycle line, or promoting the chatter, fails the build.
+ *
  * <h2>The seam</h2>
  *
  * {@code ApiManagerImpl.deploy(api)} publishes {@code SecretDiscoveryEventType.DISCOVER} carrying
@@ -331,7 +349,7 @@ public class GcpDeployTimeSecretRefs
         });
         rotationChecker.scheduleWithFixedDelay(this::checkForRotations, checkSeconds, checkSeconds, TimeUnit.SECONDS);
 
-        log.info(
+        log.warn(
             "GCP deploy-time secret substitution ACTIVE: '{}' references in API definitions are replaced at deploy time, " +
                 "rotation checked every {}s. The substituted value is readable at /_node/apis/<id> — keep that endpoint authenticated.",
             REFERENCE_SYNTAX,
@@ -377,7 +395,7 @@ public class GcpDeployTimeSecretRefs
          * check identity is what stops the old revision's REVOKE dropping the new entry.
          */
         retained.put(definition, new Retained(definitionObject, definition, event.envId(), revision, found));
-        log.info("Retained {} substitution(s) for {} revision {}", found.size(), definition, forLog(revision));
+        log.warn("Retained {} substitution(s) for {} revision {}", found.size(), definition, forLog(revision));
     }
 
     /**
@@ -410,7 +428,7 @@ public class GcpDeployTimeSecretRefs
                 );
                 return current;
             }
-            log.info(
+            log.warn(
                 "Released {} retained substitution(s) for {}: revision {} supersedes revision {} and references no gcp secret",
                 current.substitutions().size(),
                 definition,
@@ -465,7 +483,7 @@ public class GcpDeployTimeSecretRefs
                 );
                 return current;
             }
-            log.info(
+            log.warn(
                 "Released {} retained substitution(s) for {} revision {}",
                 current.substitutions().size(),
                 definition,
@@ -507,7 +525,7 @@ public class GcpDeployTimeSecretRefs
         if (!changed) {
             return;
         }
-        log.info("Publishing VALUE_CHANGED for {} so it redeploys in place", entry.definition());
+        log.warn("Publishing VALUE_CHANGED for {} so it redeploys in place", entry.definition());
         eventManager.publishEvent(
             SecretDiscoveryEventType.VALUE_CHANGED,
             new SecretDiscoveryEvent(entry.envId(), entry.definition(), new DefinitionMetadata(entry.revision()))
