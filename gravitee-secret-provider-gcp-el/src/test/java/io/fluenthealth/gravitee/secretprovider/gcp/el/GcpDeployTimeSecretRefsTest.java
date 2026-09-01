@@ -315,6 +315,11 @@ class GcpDeployTimeSecretRefsTest {
      * The mirror case: a genuinely new revision that stopped referencing a secret. A forced
      * re-register goes through {@code deploy()}, which publishes no REVOKE, so DISCOVER is the only
      * chance to let go of the superseded entry.
+     *
+     * <p>Not an exotic case. A field gains or loses a reference every time a definition is converted
+     * to use one, and again every time such a conversion is reverted — which is what happens after a
+     * conversion breaks an environment. Without this, the reverted revision's now-dead definition
+     * object stays retained, and is rewritten and republished on every subsequent value change.
      */
     @Test
     void should_release_a_superseded_entry_when_the_new_revision_references_no_secret() {
