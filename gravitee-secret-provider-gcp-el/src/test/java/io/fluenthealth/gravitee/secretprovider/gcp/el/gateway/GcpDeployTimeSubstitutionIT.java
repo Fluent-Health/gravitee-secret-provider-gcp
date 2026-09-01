@@ -43,9 +43,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.Testcontainers;
 import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.output.Slf4jLogConsumer;
-import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.utility.MountableFile;
 
 /**
  * The two load-bearing measurements for deploy-time secret substitution, against a real gateway with
@@ -117,38 +114,7 @@ class GcpDeployTimeSubstitutionIT {
         Path registry = Files.createTempDirectory("gcp-local-registry");
         Files.writeString(registry.resolve(API_ID + ".json"), LocalRegistryApi.definition(API_ID, host + "/backend", HEADER, SECRET_REF));
 
-        gateway = new GenericContainer<>("graviteeio/apim-gateway:" + APIM_VERSION)
-            .withCopyFileToContainer(
-                MountableFile.forHostPath(
-                    GatewayFixtures.artifact("gravitee-secret-provider-gcp-plugin", "gravitee-secret-provider-gcp-*.zip")
-                ),
-                "/opt/graviteeio-gateway/plugins/gravitee-secret-provider-gcp.zip"
-            )
-            .withCopyFileToContainer(
-                MountableFile.forHostPath(
-                    GatewayFixtures.artifact("gravitee-secret-provider-gcp-el", "gravitee-secret-provider-gcp-el-*.jar")
-                ),
-                "/opt/graviteeio-gateway/lib/gravitee-secret-provider-gcp-el.jar"
-            )
-            .withCopyFileToContainer(
-                MountableFile.forHostPath(
-                    GatewayFixtures.artifact("gravitee-secret-provider-gcp-core", "gravitee-secret-provider-gcp-core-*.jar")
-                ),
-                "/opt/graviteeio-gateway/lib/gravitee-secret-provider-gcp-core.jar"
-            )
-            .withCopyFileToContainer(MountableFile.forHostPath(graviteeYml(host)), "/opt/graviteeio-gateway/config/gravitee.yml")
-            .withCopyFileToContainer(MountableFile.forHostPath(GatewayFixtures.logbackXml()), "/opt/graviteeio-gateway/config/logback.xml")
-            /*
-             * Explicit 0755. The gateway runs as uid 1001 (graviteeio) and the image has no
-             * /opt/graviteeio-gateway/apis, so Testcontainers creates it — without a mode it lands
-             * unreadable by that user and LocalSyncManager dies with AccessDeniedException while the
-             * gateway still starts cleanly.
-             */
-            .withCopyFileToContainer(MountableFile.forHostPath(registry, 0755), "/opt/graviteeio-gateway/apis")
-            .withExposedPorts(8082, 18082)
-            .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("gateway"))
-            .waitingFor(Wait.forLogMessage(".*API Gateway .* started in .*\\n", 1))
-            .withStartupTimeout(Duration.ofMinutes(3));
+        gateway = GatewayFixtures.gatewayWith(APIM_VERSION, graviteeYml(host), registry, log);
         gateway.start();
     }
 
@@ -305,7 +271,7 @@ class GcpDeployTimeSubstitutionIT {
                 enabled: true
                 local:
                   enabled: true
-                  path: /opt/graviteeio-gateway/apis
+                  path: %s
               core:
                 http:
                   enabled: true
@@ -329,7 +295,7 @@ class GcpDeployTimeSubstitutionIT {
                 deployTime:
                   enabled: true
                   rotationCheckSeconds: %d
-            """.formatted(PROJECT, stubHost, stubHost, SECRET_TTL_SECONDS, ROTATION_CHECK_SECONDS);
+            """.formatted(GatewayFixtures.LOCAL_REGISTRY_DIR, PROJECT, stubHost, stubHost, SECRET_TTL_SECONDS, ROTATION_CHECK_SECONDS);
         Path file = Files.createTempDirectory("gcp-deploytime-config").resolve("gravitee.yml");
         Files.writeString(file, yml);
         return file;

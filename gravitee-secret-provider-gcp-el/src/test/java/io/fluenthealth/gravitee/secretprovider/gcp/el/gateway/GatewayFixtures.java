@@ -18,16 +18,63 @@ package io.fluenthealth.gravitee.secretprovider.gcp.el.gateway;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import org.slf4j.Logger;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.output.Slf4jLogConsumer;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.utility.MountableFile;
 
 /**
  * Shared pieces every gateway integration test needs.
  *
- * <p>{@code GcpGatewayBootstrapIT} still carries its own copies of these; if the deploy-time spike
- * graduates, that duplication should collapse onto this class rather than being left to drift.
+ * <p>{@code GcpGatewayBootstrapIT} still carries its own copies of these; it predates this class and
+ * that duplication should collapse onto it rather than being left to drift.
  */
 final class GatewayFixtures {
 
+    /** Where {@link #gatewayWith} mounts the local API registry, and what the config must point at. */
+    static final String LOCAL_REGISTRY_DIR = "/opt/graviteeio-gateway/apis";
+
+    private static final String GATEWAY_HOME = "/opt/graviteeio-gateway";
+
     private GatewayFixtures() {}
+
+    /**
+     * A gateway with the plugin ZIP, both jars, the given configuration and a local API registry
+     * installed. Ports 8082 (proxy) and 18082 (node API) are exposed.
+     *
+     * @param localRegistry a host directory of {@code *.json} definitions, mounted at
+     *     {@link #LOCAL_REGISTRY_DIR}
+     */
+    static GenericContainer<?> gatewayWith(String apimVersion, Path graviteeYml, Path localRegistry, Logger log) {
+        return new GenericContainer<>("graviteeio/apim-gateway:" + apimVersion)
+            .withCopyFileToContainer(
+                MountableFile.forHostPath(artifact("gravitee-secret-provider-gcp-plugin", "gravitee-secret-provider-gcp-*.zip")),
+                GATEWAY_HOME + "/plugins/gravitee-secret-provider-gcp.zip"
+            )
+            .withCopyFileToContainer(
+                MountableFile.forHostPath(artifact("gravitee-secret-provider-gcp-el", "gravitee-secret-provider-gcp-el-*.jar")),
+                GATEWAY_HOME + "/lib/gravitee-secret-provider-gcp-el.jar"
+            )
+            .withCopyFileToContainer(
+                MountableFile.forHostPath(artifact("gravitee-secret-provider-gcp-core", "gravitee-secret-provider-gcp-core-*.jar")),
+                GATEWAY_HOME + "/lib/gravitee-secret-provider-gcp-core.jar"
+            )
+            .withCopyFileToContainer(MountableFile.forHostPath(graviteeYml), GATEWAY_HOME + "/config/gravitee.yml")
+            .withCopyFileToContainer(MountableFile.forHostPath(logbackXml()), GATEWAY_HOME + "/config/logback.xml")
+            /*
+             * Explicit 0755. The gateway runs as uid 1001 (graviteeio) and the image has no
+             * /opt/graviteeio-gateway/apis, so Testcontainers creates it — without a mode it lands
+             * unreadable by that user and LocalSyncManager dies with AccessDeniedException while the
+             * gateway still starts cleanly.
+             */
+            .withCopyFileToContainer(MountableFile.forHostPath(localRegistry, 0755), LOCAL_REGISTRY_DIR)
+            .withExposedPorts(8082, 18082)
+            .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("gateway"))
+            .waitingFor(Wait.forLogMessage(".*API Gateway .* started in .*\\n", 1))
+            .withStartupTimeout(Duration.ofMinutes(3));
+    }
 
     /** Locates an artifact built by the reactor. */
     static Path artifact(String moduleDir, String glob) {

@@ -23,8 +23,16 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
  *
  * <p>Enabled with {@code services.sync.local.enabled: true} and {@code services.sync.local.path},
  * {@code LocalApiSynchronizer} reads every {@code *.json} in that directory, deploys it through
- * {@code ApiManager.register(...)}, and watches the directory so a rewritten file redeploys. That is
- * what makes a deployed-API test affordable here: no MongoDB, no management API.
+ * {@code ApiManager.register(...)}, and watches the directory. That is what makes a deployed-API test
+ * affordable here: no MongoDB, no management API.
+ *
+ * <p><b>Only ENTRY_CREATE is usable for a V4 API.</b> The watcher's ENTRY_MODIFY and ENTRY_DELETE
+ * branches both do {@code (io.gravitee.gateway.handlers.api.definition.Api) definitions.get(path)} —
+ * the <em>V2</em> reactable class. For a V4 api that is a {@code ClassCastException} thrown inside the
+ * {@code Flowable.interval} map function, which terminates the watcher for the rest of the process.
+ * So a redeploy has to arrive as a <em>new file</em> naming the same api id with a higher
+ * {@code deployment_number} and a later {@code createdAt}, and it has to arrive by a rename into the
+ * directory rather than a write, or the trailing ENTRY_MODIFY kills the watcher anyway.
  *
  * <p>The format is three levels of nesting, two of them JSON <em>strings</em>, which is why this is
  * built with Jackson rather than written by hand:
@@ -60,6 +68,52 @@ final class LocalRegistryApi {
      * @param headerValue value for that header — a {@code secret://gcp/...} reference in these tests
      */
     static String definition(String apiId, String upstreamTarget, String headerName, String headerValue) {
+        return definition(new Revision(apiId, upstreamTarget, headerName, headerValue, "1", System.currentTimeMillis(), true));
+    }
+
+    /**
+     * One deployable revision of an API.
+     *
+     * <p>{@code revision} and {@code createdAt} are what make a redeploy a redeploy.
+     * {@code ApiMapper} reads the revision off the {@code deployment_number} event property and
+     * {@code deployedAt} off the event's {@code createdAt}, and {@code ApiManagerImpl.doRegister}
+     * treats an api as an <em>update</em> only when both moved — a later {@code deployedAt}
+     * <em>and</em> a different revision. Get either wrong and the file is read, mapped, and then
+     * silently ignored.
+     *
+     * @param started {@code false} maps to {@code lifecycleState} other than {@code STARTED}, which
+     *     {@code ApiMapper} turns into {@code enabled=false}; {@code update()} then undeploys the api
+     *     instead of updating it. That is the cheapest way to reach {@code undeploy}, because the
+     *     obvious route — deleting the registry file — goes through
+     *     {@code LocalApiSynchronizer}'s ENTRY_DELETE branch, which casts to the <em>V2</em> api class
+     *     and throws {@code ClassCastException} for anything V4.
+     * @param headerValue when {@code null} the flow carries no policy step at all, i.e. a revision
+     *     that references no secret
+     */
+    record Revision(
+        String apiId,
+        String upstreamTarget,
+        String headerName,
+        String headerValue,
+        String revision,
+        long createdAt,
+        boolean started
+    ) {
+        Revision at(String revision, long createdAt) {
+            return new Revision(apiId, upstreamTarget, headerName, headerValue, revision, createdAt, started);
+        }
+
+        Revision stopped() {
+            return new Revision(apiId, upstreamTarget, headerName, headerValue, revision, createdAt, false);
+        }
+    }
+
+    static String definition(Revision spec) {
+        String apiId = spec.apiId();
+        String upstreamTarget = spec.upstreamTarget();
+        String headerName = spec.headerName();
+        String headerValue = spec.headerValue();
+
         ObjectNode v4 = MAPPER.createObjectNode();
         v4.put("id", apiId);
         v4.put("name", apiId);
@@ -101,32 +155,34 @@ final class LocalRegistryApi {
          * field-agnostic: substitution rewrites the step's whole configuration JSON before the policy
          * deserialises it, so a field no EL can reach behaves identically.
          */
-        ObjectNode step = flow.putArray("request").addObject();
-        step.put("name", "add-credential-header");
-        step.put("enabled", true);
-        step.put("policy", "transform-headers");
-        ObjectNode headers = step.putObject("configuration");
-        ObjectNode header = headers.putArray("addHeaders").addObject();
-        header.put("name", headerName);
-        header.put("value", headerValue);
+        if (headerValue != null) {
+            ObjectNode step = flow.putArray("request").addObject();
+            step.put("name", "add-credential-header");
+            step.put("enabled", true);
+            step.put("policy", "transform-headers");
+            ObjectNode headers = step.putObject("configuration");
+            ObjectNode header = headers.putArray("addHeaders").addObject();
+            header.put("name", headerName);
+            header.put("value", headerValue);
+        }
 
         ObjectNode repositoryApi = MAPPER.createObjectNode();
         repositoryApi.put("id", apiId);
         repositoryApi.put("name", apiId);
         repositoryApi.put("definitionVersion", "4.0.0");
         repositoryApi.put("type", "proxy");
-        repositoryApi.put("lifecycleState", "STARTED");
+        repositoryApi.put("lifecycleState", spec.started() ? "STARTED" : "STOPPED");
         repositoryApi.put("environmentId", "DEFAULT");
         repositoryApi.put("definition", writeAsString(v4));
 
         ObjectNode event = MAPPER.createObjectNode();
-        event.put("id", "evt-" + apiId);
+        event.put("id", "evt-%s-%s".formatted(apiId, spec.revision()));
         event.put("type", "PUBLISH_API");
         event.put("payload", writeAsString(repositoryApi));
-        event.put("createdAt", System.currentTimeMillis());
+        event.put("createdAt", spec.createdAt());
         ObjectNode properties = event.putObject("properties");
         properties.put("api_id", apiId);
-        properties.put("deployment_number", "1");
+        properties.put("deployment_number", spec.revision());
 
         ObjectNode file = MAPPER.createObjectNode();
         file.set("apiEvent", event);

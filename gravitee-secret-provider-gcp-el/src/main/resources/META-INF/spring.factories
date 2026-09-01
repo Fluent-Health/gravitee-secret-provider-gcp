@@ -16,10 +16,11 @@
 # holds only Configuration/Environment and the secret plugin manager. We are not really a plugin
 # handler — canHandle() returns false — the interface is purely the registration hook.
 #
-# GcpDeployTimeSecretRefs rides the same key. It is a SPIKE, opt-in via
-# secrets.gcp.deployTime.enabled and inert when that is false, which is the default. Registering it
-# unconditionally is deliberate: whether the bean is created early enough to catch the first API's
-# DISCOVER event is exactly what has to be measured, and a conditional registration would hide it.
+# GcpDeployTimeSecretRefs (mode A3) rides the same key. It is opt-in via
+# secrets.gcp.deployTime.enabled and inert when that is false, which is the default: it subscribes to
+# nothing and starts no thread. Registering it unconditionally is what makes it a BeanPostProcessor
+# early enough to see the EventManager bean, and therefore the first API's DISCOVER event; a
+# conditional registration would make activation depend on bean ordering rather than on the property.
 io.gravitee.plugin.core.api.PluginHandler=\
     io.fluenthealth.gravitee.secretprovider.gcp.el.GcpSecretsTemplateVariableProvider,\
     io.fluenthealth.gravitee.secretprovider.gcp.el.GcpDeployTimeSecretRefs

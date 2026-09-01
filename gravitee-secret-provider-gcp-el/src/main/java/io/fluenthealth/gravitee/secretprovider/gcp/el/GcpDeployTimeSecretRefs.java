@@ -26,6 +26,7 @@ import io.gravitee.secrets.api.discovery.DefinitionDescriptor;
 import io.gravitee.secrets.api.discovery.DefinitionMetadata;
 import io.gravitee.secrets.api.discovery.DefinitionSecretRefsFinder;
 import io.gravitee.secrets.api.discovery.SecretRefsLocation;
+import io.gravitee.secrets.api.errors.SecretManagerException;
 import io.gravitee.secrets.api.event.SecretDiscoveryEvent;
 import io.gravitee.secrets.api.event.SecretDiscoveryEventType;
 import java.util.ArrayList;
@@ -49,14 +50,23 @@ import org.springframework.context.EnvironmentAware;
 import org.springframework.core.env.Environment;
 
 /**
- * <strong>SPIKE / RFC — opt-in, default off, not a supported feature.</strong>
+ * Mode A3 — substitutes {@code secret://gcp/<secret>[/<version>]:<key>} references in an API
+ * definition at <em>deploy</em> time, so fields no expression language can reach can still carry a
+ * secret. Opt-in via {@link #DEPLOY_TIME_ENABLED_PROPERTY}, off by default.
  *
- * <p>Substitutes {@code secret://gcp/<secret>[/<version>]:<key>} references in an API definition at
- * <em>deploy</em> time, so fields no expression language can reach can still carry a secret:
- * {@code policy-generate-jwt}'s HMAC {@code content}, {@code request-validation} ENUM constraints,
- * {@code dynamic-routing} urls, {@code policy-assign-content}'s FreeMarker body, a JWT plan's
- * {@code resolverParameter}. Substitution rewrites the raw configuration JSON before the policy
- * deserialises it, so eligibility is not a per-field decision at all.
+ * <h2>Why deploy time, when mode A2 exists</h2>
+ *
+ * A request-time reference only resolves in a field the policy hands to
+ * {@code TemplateEngine.eval()} — the sole entry point that can await a deferred value. Several
+ * upstream policies never do: {@code policy-generate-jwt} passes its HMAC {@code content} straight
+ * to {@code new MACSigner(...)}, {@code policy-request-validation} maps ENUM constraint parameters
+ * through {@code templateEngine::convert}, {@code dynamic-routing} reads its rule url with
+ * {@code getValue}, and {@code policy-assign-content}'s body is FreeMarker rather than EL. For those
+ * fields no request-time reference can ever work.
+ *
+ * <p>Substitution rewrites the step's whole raw configuration JSON before the policy deserialises
+ * it, so eligibility stops being a per-field question: whatever the policy does with the value
+ * afterwards, it sees a plain string.
  *
  * <h2>The seam</h2>
  *
@@ -80,23 +90,35 @@ import org.springframework.core.env.Environment;
  * <h2>Rotation</h2>
  *
  * {@code updateApiOnSecretChange} republishes no DISCOVER — it fires {@code ReactorEvent.UPDATE} for
- * the <em>cached</em> api object without re-registering. So the retained setters are the only way the
- * new value can get in: re-resolve, write through, then publish VALUE_CHANGED.
+ * the <em>cached</em> api object without re-registering. So the retained setters are the only way
+ * the new value can get in: re-resolve, write through, then publish VALUE_CHANGED. Measured against
+ * a real gateway: the API is updated in place, with no restart and no re-registration.
+ *
+ * <p>{@code ApiManagerImpl} acts on VALUE_CHANGED only for the {@code api-v4} and
+ * {@code native-api-v4} definition kinds, so in-place rotation is confined to those. A reference in
+ * any other kind of definition is still substituted at deploy time, but a later value change reaches
+ * it only when that definition is itself redeployed.
  *
  * <h2>Cost</h2>
  *
  * The substituted value lives in the definition object the gateway holds, which
- * {@code ApiManagementEndpoint} serialises verbatim at {@code /_node/apis/<id>}. Request-time EL
- * stays the primary mechanism; this is for the fields it cannot reach.
+ * {@code ApiManagementEndpoint} serialises verbatim at {@code /_node/apis/<id>} — measured, not
+ * assumed. Keep that endpoint authenticated (the shipped {@code gravitee.yml} already binds it to
+ * {@code localhost} with basic auth) and keep request-time EL as the primary mechanism; this is for
+ * the fields it cannot reach.
  */
 public class GcpDeployTimeSecretRefs
     implements PluginHandler, EnvironmentAware, ApplicationContextAware, BeanPostProcessor, DisposableBean {
 
-    /** Opt-in. Off by default: this is a spike, and it trades away the exposure noted above. */
+    /** Opt-in. Off by default: it trades away the {@code /_node/apis} exposure noted above. */
     public static final String DEPLOY_TIME_ENABLED_PROPERTY = "secrets.gcp.deployTime.enabled";
 
     /** How often retained references are re-resolved to notice a rotation. */
     public static final String ROTATION_CHECK_SECONDS_PROPERTY = "secrets.gcp.deployTime.rotationCheckSeconds";
+
+    private static final long ROTATION_CHECK_SECONDS_DEFAULT = 60L;
+
+    private static final String REFERENCE_SYNTAX = "secret://gcp/<secret>[/<version>]:<key>";
 
     /**
      * {@code secret://gcp/<secret>[/<version>]:<key>} — the gravitee.yml reference syntax, reused
@@ -107,22 +129,40 @@ public class GcpDeployTimeSecretRefs
 
     private static final Logger log = LoggerFactory.getLogger(GcpDeployTimeSecretRefs.class);
 
+    private final CachingGcpSecretResolver injectedResolver;
+
     private Environment environment;
     private ApplicationContext applicationContext;
     private EventManager eventManager;
     private GcpResolverFactory.Resolver resolverHolder;
     private ScheduledExecutorService rotationChecker;
 
-    /** Keyed by definition id, so a rotation can rewrite what was already substituted. */
-    private final Map<String, Retained> retained = new ConcurrentHashMap<>();
+    /**
+     * Keyed by {@link Definition}, which is {@code (kind, id)} — not by id alone, because ids are
+     * only unique within a kind and the gateway publishes discovery events for several of them.
+     */
+    private final Map<Definition, Retained> retained = new ConcurrentHashMap<>();
 
-    private record Retained(Definition definition, String envId, String revision, List<Substitution> substitutions) {}
+    /**
+     * @param definitionObject the very definition instance that was substituted, kept for identity
+     *     comparison on REVOKE — see {@link #onRevoke}
+     */
+    private record Retained(
+        Object definitionObject,
+        Definition definition,
+        String envId,
+        String revision,
+        List<Substitution> substitutions
+    ) {}
 
+    /** One reference-bearing field: how to re-resolve it, and how to write the result back. */
     private static final class Substitution {
 
         private final SecretRefsLocation location;
         private final String originalPayload;
         private final Consumer<String> setter;
+
+        /** Written and read only by the rotation thread, so it needs no synchronisation. */
         private String lastSubstituted;
 
         Substitution(SecretRefsLocation location, String originalPayload, Consumer<String> setter, String lastSubstituted) {
@@ -131,6 +171,15 @@ public class GcpDeployTimeSecretRefs
             this.setter = setter;
             this.lastSubstituted = lastSubstituted;
         }
+    }
+
+    public GcpDeployTimeSecretRefs() {
+        this(null);
+    }
+
+    /** Test seam: a resolver over a stub Secret Manager client, so no Vert.x needs to be created. */
+    GcpDeployTimeSecretRefs(CachingGcpSecretResolver injectedResolver) {
+        this.injectedResolver = injectedResolver;
     }
 
     @Override
@@ -178,7 +227,7 @@ public class GcpDeployTimeSecretRefs
             SecretDiscoveryEventType.REVOKE
         );
 
-        long checkSeconds = environment.getProperty(ROTATION_CHECK_SECONDS_PROPERTY, Long.class, 60L);
+        long checkSeconds = environment.getProperty(ROTATION_CHECK_SECONDS_PROPERTY, Long.class, ROTATION_CHECK_SECONDS_DEFAULT);
         rotationChecker = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "gcp-deploytime-rotation");
             thread.setDaemon(true);
@@ -186,67 +235,142 @@ public class GcpDeployTimeSecretRefs
         });
         rotationChecker.scheduleWithFixedDelay(this::checkForRotations, checkSeconds, checkSeconds, TimeUnit.SECONDS);
 
-        log.info("GCP deploy-time secret substitution ARMED (DISCOVER + REVOKE, rotation check every {}s)", checkSeconds);
+        log.info(
+            "GCP deploy-time secret substitution ACTIVE: '{}' references in API definitions are replaced at deploy time, " +
+                "rotation checked every {}s. The substituted value is readable at /_node/apis/<id> — keep that endpoint authenticated.",
+            REFERENCE_SYNTAX,
+            checkSeconds
+        );
         return bean;
     }
 
     // ── Deploy ────────────────────────────────────────────────────────────────
 
     private void onDiscover(SecretDiscoveryEvent event) {
-        DefinitionSecretRefsFinder<Object> finder = finderFor(event.definition());
+        Object definitionObject = event.definition();
+        DefinitionSecretRefsFinder<Object> finder = finderFor(definitionObject);
         if (finder == null) {
             return;
         }
-        DefinitionDescriptor descriptor = finder.toDefinitionDescriptor(event.definition(), event.metadata());
+        DefinitionDescriptor descriptor = finder.toDefinitionDescriptor(definitionObject, event.metadata());
+        Definition definition = descriptor.definition();
+        String revision = descriptor.revision().orElse(null);
 
         List<Substitution> found = new ArrayList<>();
-        finder.findSecretRefs(event.definition(), (payload, location, setter) -> {
+        finder.findSecretRefs(definitionObject, (payload, location, setter) -> {
             if (payload == null || !SECRET_REF.matcher(payload).find()) {
                 return;
             }
-            String substituted = substitute(payload);
+            String substituted = substitute(payload, location);
             setter.accept(substituted);
             found.add(new Substitution(location, payload, setter, substituted));
             log.info("Substituted a gcp reference at {}", location);
         });
 
         if (found.isEmpty()) {
+            onDiscoverWithNothingToSubstitute(definition, definitionObject, revision);
             return;
         }
-        Definition definition = descriptor.definition();
         /*
-         * Replaces any entry for the same id. A redeploy publishes DISCOVER for the new revision and
-         * REVOKE for the old, in that order, so keying by id and letting REVOKE check the revision is
-         * what stops the old revision's REVOKE dropping the new entry.
+         * Replaces any entry for the same definition. A redeploy publishes DISCOVER for the new
+         * revision and REVOKE for the old, in that order, so overwriting here and letting onRevoke
+         * check identity is what stops the old revision's REVOKE dropping the new entry.
          */
-        retained.put(definition.id(), new Retained(definition, event.envId(), descriptor.revision().orElse(null), found));
-        log.info(
-            "Retained {} substitution(s) for definition {} revision {}",
-            found.size(),
-            definition.id(),
-            descriptor.revision().orElse("-")
-        );
+        retained.put(definition, new Retained(definitionObject, definition, event.envId(), revision, found));
+        log.info("Retained {} substitution(s) for {} revision {}", found.size(), definition, forLog(revision));
     }
 
-    private void onRevoke(SecretDiscoveryEvent event) {
-        DefinitionSecretRefsFinder<Object> finder = finderFor(event.definition());
-        if (finder == null) {
-            return;
-        }
-        DefinitionDescriptor descriptor = finder.toDefinitionDescriptor(event.definition(), event.metadata());
-        String id = descriptor.definition().id();
-        String revoked = descriptor.revision().orElse(null);
-
-        retained.compute(id, (key, current) -> {
+    /**
+     * A DISCOVER that found nothing is two different situations, and telling them apart is what keeps
+     * rotation working.
+     *
+     * <ul>
+     *   <li><b>The same definition instance already substituted.</b> Its references are gone
+     *       precisely <em>because</em> they were replaced, so there is nothing left for the pattern
+     *       to match. {@code ApiManagerImpl.refresh()} re-registers the cached api objects with
+     *       {@code force=true}, which republishes DISCOVER for exactly those instances — dropping the
+     *       entry here would silently stop rotation after any gateway tag or configuration reload.
+     *   <li><b>A different instance.</b> A genuinely new revision that no longer references a secret,
+     *       so whatever is retained belongs to a superseded revision and must go. A forced
+     *       re-register goes through {@code deploy()}, which publishes no REVOKE at all, so this is
+     *       the only place that release can happen.
+     * </ul>
+     */
+    private void onDiscoverWithNothingToSubstitute(Definition definition, Object definitionObject, String revision) {
+        retained.compute(definition, (key, current) -> {
             if (current == null) {
                 return null;
             }
-            if (!Objects.equals(current.revision(), revoked)) {
-                // A superseded revision being revoked after the new one was already retained.
-                log.debug("Ignoring REVOKE for {} revision {}; retained revision is {}", id, revoked, current.revision());
+            if (current.definitionObject() == definitionObject) {
+                log.debug(
+                    "Re-discovered {} revision {}; keeping its {} retained substitution(s)",
+                    definition,
+                    forLog(revision),
+                    current.substitutions().size()
+                );
                 return current;
             }
-            log.info("Released {} retained substitution(s) for definition {} revision {}", current.substitutions().size(), id, revoked);
+            log.info(
+                "Released {} retained substitution(s) for {}: revision {} supersedes revision {} and references no gcp secret",
+                current.substitutions().size(),
+                definition,
+                forLog(revision),
+                forLog(current.revision())
+            );
+            return null;
+        });
+    }
+
+    // ── Revoke ────────────────────────────────────────────────────────────────
+
+    /**
+     * Releases what a definition retained, but only when the REVOKE really is for the revision now in
+     * force.
+     *
+     * <p>{@code ApiManagerImpl.update(api)} publishes DISCOVER for the new revision <em>before</em>
+     * REVOKE for the previous one, so a naive handler would let the superseded revision's REVOKE drop
+     * the entry the live revision depends on — rotation would then stop, silently, on the first
+     * redeploy.
+     *
+     * <p>The test is object identity. {@code deploy()} and {@code update()} publish DISCOVER carrying
+     * the api's own definition instance and {@code undeploy()} publishes REVOKE carrying that same
+     * instance, whereas {@code update()}'s REVOKE carries the <em>previous</em> api's instance.
+     * Identity is used rather than the revision string because the revision comes from the optional
+     * {@code deployment_number} event property: a sync source that sets none would otherwise compare
+     * {@code null} to {@code null} and release on every redeploy. The revision is still honoured as a
+     * fallback, so an unforeseen re-parse of the live revision cannot strand an entry forever.
+     */
+    private void onRevoke(SecretDiscoveryEvent event) {
+        Object definitionObject = event.definition();
+        DefinitionSecretRefsFinder<Object> finder = finderFor(definitionObject);
+        if (finder == null) {
+            return;
+        }
+        DefinitionDescriptor descriptor = finder.toDefinitionDescriptor(definitionObject, event.metadata());
+        Definition definition = descriptor.definition();
+        String revoked = descriptor.revision().orElse(null);
+
+        retained.compute(definition, (key, current) -> {
+            if (current == null) {
+                return null;
+            }
+            boolean sameInstance = current.definitionObject() == definitionObject;
+            boolean sameRevision = revoked != null && Objects.equals(current.revision(), revoked);
+            if (!sameInstance && !sameRevision) {
+                log.debug(
+                    "Ignoring REVOKE of {} revision {}; it is superseded by the retained revision {}",
+                    definition,
+                    forLog(revoked),
+                    forLog(current.revision())
+                );
+                return current;
+            }
+            log.info(
+                "Released {} retained substitution(s) for {} revision {}",
+                current.substitutions().size(),
+                definition,
+                forLog(revoked)
+            );
             return null;
         });
     }
@@ -263,7 +387,7 @@ public class GcpDeployTimeSecretRefs
                 rotate(entry);
             } catch (Exception e) {
                 // One bad definition must not kill the scheduler for every other one.
-                log.warn("Rotation check failed for definition {}: {}", entry.definition().id(), e.toString());
+                log.warn("Rotation check failed for {}: {}", entry.definition(), e.toString());
             }
         }
     }
@@ -271,7 +395,7 @@ public class GcpDeployTimeSecretRefs
     private void rotate(Retained entry) {
         boolean changed = false;
         for (Substitution substitution : entry.substitutions()) {
-            String resubstituted = substitute(substitution.originalPayload);
+            String resubstituted = substitute(substitution.originalPayload, substitution.location);
             if (resubstituted.equals(substitution.lastSubstituted)) {
                 continue;
             }
@@ -283,7 +407,7 @@ public class GcpDeployTimeSecretRefs
         if (!changed) {
             return;
         }
-        log.info("Publishing VALUE_CHANGED for definition {} so it redeploys in place", entry.definition().id());
+        log.info("Publishing VALUE_CHANGED for {} so it redeploys in place", entry.definition());
         eventManager.publishEvent(
             SecretDiscoveryEventType.VALUE_CHANGED,
             new SecretDiscoveryEvent(entry.envId(), entry.definition(), new DefinitionMetadata(entry.revision()))
@@ -292,12 +416,20 @@ public class GcpDeployTimeSecretRefs
 
     // ── Resolution ────────────────────────────────────────────────────────────
 
-    /** Replaces every reference in a raw configuration payload with its resolved value. */
-    private String substitute(String payload) {
+    /**
+     * Replaces every reference in a raw configuration payload with its resolved value.
+     *
+     * <p>A resolution failure is deliberately not swallowed. On the DISCOVER path it propagates out
+     * of {@code ApiManagerImpl.deploy}/{@code update} and fails that API's deployment, which is the
+     * safe outcome — the alternative is an API served with a literal {@code secret://gcp/...} in a
+     * credential field. On the rotation path {@link #checkForRotations()} logs it and the value
+     * already in force stays.
+     */
+    private String substitute(String payload, SecretRefsLocation location) {
         Matcher matcher = SECRET_REF.matcher(payload);
         StringBuilder out = new StringBuilder();
         while (matcher.find()) {
-            String value = resolve(matcher.group());
+            String value = resolve(matcher.group(), location);
             // The payload is JSON and the value lands inside a JSON string literal, so a quote or
             // backslash in a secret would otherwise break out of it.
             matcher.appendReplacement(out, Matcher.quoteReplacement(escapeForJsonStringBody(value)));
@@ -306,19 +438,32 @@ public class GcpDeployTimeSecretRefs
         return out.toString();
     }
 
-    private String resolve(String reference) {
+    private String resolve(String reference, SecretRefsLocation location) {
         // secret://gcp/... -> /gcp/..., the URI form SecretURL.from expects.
         String uri = reference.substring("secret:/".length());
-        /*
-         * blockingGet is correct here and only here. Deploy-time substitution runs on an API-manager
-         * or sync executor thread, or this class's own rotation thread — never a Vert.x event loop —
-         * and the SPI setter it feeds is synchronous, so there is nothing to defer to. Request-time
-         * resolution is the opposite case, which is why GcpSecretsElHolder returns Single.
-         */
-        return resolver().resolveKey(SecretURL.from(uri, true)).blockingGet();
+        try {
+            /*
+             * blockingGet is correct here and only here. Deploy-time substitution runs on an
+             * API-manager or sync executor thread, or this class's own rotation thread — never a
+             * Vert.x event loop — and the SPI setter it feeds is synchronous, so there is nothing to
+             * defer to. Request-time resolution is the opposite case, which is why GcpSecretsElHolder
+             * returns Single.
+             */
+            return resolver().resolveKey(SecretURL.from(uri, true)).blockingGet();
+        } catch (RuntimeException e) {
+            // Name the location. Without it the failure reads as a bare "secret not found" against a
+            // definition whose reference could be in any of a dozen plugin configurations.
+            throw new SecretManagerException(
+                "Could not resolve '%s' at %s while substituting an API definition at deploy time".formatted(reference, location),
+                e
+            );
+        }
     }
 
     private synchronized CachingGcpSecretResolver resolver() {
+        if (injectedResolver != null) {
+            return injectedResolver;
+        }
         if (resolverHolder == null) {
             GcpConfig config = GcpElConfigReader.read(environment);
             resolverHolder = GcpResolverFactory.create(config, "gravitee-secret-provider-gcp-deploytime");
@@ -354,6 +499,11 @@ public class GcpDeployTimeSecretRefs
             .map(candidate -> (DefinitionSecretRefsFinder<Object>) candidate)
             .findFirst()
             .orElse(null);
+    }
+
+    /** The revision is optional, and {@code null} in a log line reads as a bug rather than a fact. */
+    private static String forLog(String revision) {
+        return revision == null ? "(none)" : revision;
     }
 
     @Override

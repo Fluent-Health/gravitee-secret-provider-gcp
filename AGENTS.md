@@ -236,35 +236,104 @@ Two consequences, both learned the hard way:
   — produced no output either. Absence of our lines says nothing about whether the code ran. Raise
   the level first, then measure.
 
+## Verified facts about the secret discovery lifecycle (APIM 4.12.12)
+
+Mode A3 (`GcpDeployTimeSecretRefs`) hangs off `SecretDiscoveryEventType`. Everything below was read
+off `ApiManagerImpl` at tag `4.12.12` and, where marked **observed**, seen in
+`GcpDeployTimeRevocationIT` against a real gateway.
+
+### DISCOVER precedes REVOKE on a redeploy, and both carry the raw definition
+
+`deploy(api)` publishes `DISCOVER`, then `apis.put`, then `ReactorEvent.DEPLOY` — and **no REVOKE**.
+`update(api)` publishes `DISCOVER` for the new revision, `apis.put`, `ReactorEvent.UPDATE`, and
+*then* `REVOKE` for the **previous** api's definition. `undeploy(apiId)` publishes
+`ReactorEvent.UNDEPLOY` then `REVOKE` for the definition in force.
+
+So a handler that releases on any `REVOKE` matching the api id drops the entry the *live* revision
+depends on, and rotation is dead from the first redeploy onwards with nothing logged. **Observed**:
+that exact ordering, the superseded revision's `REVOKE` arriving after the new revision was retained.
+
+`REVOKE`'s `definition()` is the previous api's own definition **instance**, never the new one's,
+which is what makes object identity a sound test — and a sounder one than the revision string, since
+`ApiMapper` reads the revision from the *optional* `deployment_number` event property and leaves it
+`null` when absent.
+
+### `refresh()` republishes DISCOVER for definitions already substituted
+
+`refresh()` takes `new ArrayList<>(apis.values())` and calls `register(api, true)` on each, so
+`force` routes them through `deploy()` — republishing `DISCOVER` for the very same definition
+instances. Their references are gone by then, because substitution replaced them. A handler that
+reads "found nothing" as "no longer needed" therefore stops rotating after any gateway tag or
+configuration reload.
+
+### VALUE_CHANGED is filtered to two definition kinds
+
+`ApiManagerImpl.SUPPORTED_SECRET_DEFINITION_KINDS` is `Set.of("api-v4", "native-api-v4")`. A
+`VALUE_CHANGED` for any other kind is logged at debug and dropped, so in-place rotation cannot be
+extended to shared policy groups from this side.
+
+### `EventManager.publishEvent` is synchronous — now confirmed at runtime
+
+`EventManagerImpl` holds only a listeners map: no executor, queue or future. **Observed**: the
+`ApiManagerImpl` lines for a rotation appear on `gcp-deploytime-rotation`, this plugin's own thread.
+That is what makes substituting before deployment work at all.
+
+### The local API registry: only ENTRY_CREATE is usable for a V4 API
+
+`services.sync.local.enabled: true` plus `services.sync.local.path` is the cheap way to get a
+*deployed* API into a Testcontainers gateway — no MongoDB, no management API. But
+`LocalApiSynchronizer.watch` casts the stored definition to
+`io.gravitee.gateway.handlers.api.definition.Api` — the **V2** reactable class — in both its
+`ENTRY_MODIFY` and `ENTRY_DELETE` branches. For a V4 api that is a `ClassCastException` thrown inside
+a `Flowable.interval` map function, which terminates the watcher for the rest of the process.
+
+Consequences for any test that wants a second revision:
+
+- Deliver it as a **new file** naming the same api id, with a higher `deployment_number` and a later
+  event `createdAt`. `doRegister` treats an api as an update only when *both* moved.
+- Get it there by a **rename into the directory**, not a write: a write also fires `ENTRY_MODIFY`.
+  `GcpDeployTimeRevocationIT.dropIntoRegistry` copies to `/tmp` and `mv`s as root, because the
+  registry directory is root-owned while the gateway runs as uid 1001.
+- To reach `undeploy`, publish a revision whose `lifecycleState` is not `STARTED`. `ApiMapper` turns
+  that into `enabled=false` and `update()` undeploys instead of updating.
+
+Two more harness costs already paid, each a wasted boot:
+
+- The image has no `/opt/graviteeio-gateway/apis`, so Testcontainers creates it — and without an
+  explicit `0755` it lands unreadable by uid 1001. `LocalSyncManager` then dies with
+  `AccessDeniedException` while the gateway still starts cleanly.
+- Local-registry enum values are **labels, not enum names**: `"4.0.0"` not `"V4"`, `"proxy"` not
+  `"PROXY"`. A wrong `definitionVersion` routes the definition to the V2 deserializer, which fails
+  with "A proxy property is required" — an error naming nothing relevant.
+
 ## Repo conventions
 
 - Java 21, Maven, three modules: `core` (the only GCP-aware code), `plugin` (the ZIP), `el` (the
-  `lib/ext` jar).
+  jar that goes in `lib/` — **not** `lib/ext/`, which cannot see `gravitee-expression-language`).
 - `mvn verify` runs `prettier:check` and `license:check` at `validate`. `mvn prettier:write
   license:format` fixes both. `-Dskip.validation=true` skips them for a fast loop.
 - gravitee-parent's ArchUnit rules are switched off (`gravitee.archrules.skip`): they enforce
   Gravitee's internal logging facade, which is not part of the plugin SPI. SLF4J is correct here, as
   it is for the OSS Kubernetes provider.
 - Tests: JUnit 5 + AssertJ + RxJava `TestObserver` (`.test().awaitDone(...)`), WireMock for both
-  Google endpoints. No Testcontainers — nothing here needs a gateway running to be tested, with the
-  exception noted below.
+  Google endpoints, Mockito where a Spring type has to be stood in for. Testcontainers only in the
+  `*IT` suites under `el/gateway`, which are opt-in behind `-Pintegration-test`.
+- `-Pintegration-test` boots three gateways: `GcpGatewayBootstrapIT` (artifacts and beans, no API
+  deployed), `GcpDeployTimeSubstitutionIT` (mode A3 rotation and the `/_node/apis` exposure) and
+  `GcpDeployTimeRevocationIT` (mode A3 across a redeploy and an undeploy). The deploy-time suites
+  deploy real APIs through the local registry — see the lifecycle section above for its traps.
 - Never log a secret value, a payload, or an access token. Log the secret name, project and version.
 
 ## Not yet done
 
-- No test resolves a secret inside a **deployed** API. `GcpGatewayBootstrapIT` boots a real gateway
-  and proves the artifacts load and the beans initialise; `GcpSecretsElEvaluationTest` proves the EL
-  contract against the real EL implementation. Neither drives a request through a deployed API
-  definition.
-
-  This is cheaper than it used to look. APIM 4.12 **does** ship a local registry —
-  `LocalSyncManager` / `LocalApiSynchronizer` in `services-sync`, enabled with
-  `services.sync.local.enabled: true` and `services.sync.local.path` (default `${gravitee.home}/apis`)
-  — which deploys every `*.json` in that directory and re-deploys on change via a `WatchService`. So
-  no MongoDB and no management API are needed, contrary to what this file and
-  `GcpGatewayBootstrapIT` previously claimed. The only awkward part is the file format:
-  `{"apiEvent": {...}}` wrapping a repository `Event` whose `payload` is a JSON *string* of a
-  repository `Api`, whose `definition` is another JSON string of the V4 model.
+- **No test resolves a secret at request time inside a deployed API.** The deploy-time suites drive
+  requests through a deployed definition, but mode A2's own path — a `{#secrets.get(...)}` expression
+  evaluated per request by a policy in a deployed API — is still covered only by
+  `GcpSecretsElEvaluationTest` against the real EL implementation, not by a gateway. The local
+  registry makes this affordable now; the pieces are in `LocalRegistryApi` and `GatewayFixtures`.
+- **Mode A3's rotation interval is per-JVM, not per-secret.** Every retained reference is re-resolved
+  on the same schedule. Fine at the scale this was built for; a gateway with hundreds of substituted
+  references would want the interval derived from the TTL instead.
 - Deployment is out of scope for this repo: getting the artifacts onto a gateway (baked into an
   image or mounted) and wiring `secrets.gcp.*` plus the `el.whitelist.list` entries through whatever
   manages your gateway configuration.

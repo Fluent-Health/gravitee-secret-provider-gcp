@@ -33,9 +33,10 @@ jobs:
       - name: Build artifacts
         run: mvn package -DskipTests -Dskip.validation=true --batch-mode
 
-      # Boots a real gateway with both artifacts installed. Needs Docker but no GCP, so it runs on
-      # every PR including from forks. This is what guards the gateway-internal contracts —
-      # classloader placement, the spring.factories key, and secret-provider config discovery.
+      # Boots real gateways with both artifacts installed — one per IT suite. Needs Docker but no
+      # GCP, so it runs on every PR including from forks. This is what guards the gateway-internal
+      # contracts — classloader placement, the spring.factories key, secret-provider config
+      # discovery, and the deploy-time substitution lifecycle against a really deployed API.
       - name: Gateway integration test
         run: mvn verify -Pintegration-test -Dskip.validation=true --batch-mode
 
