@@ -36,6 +36,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -94,6 +95,24 @@ import org.springframework.core.env.Environment;
  * the two copies then have to be rotated together, nothing about either opaque blob reveals that
  * they have drifted, and the rotation described below would propagate whichever half was updated.
  *
+ * <h2>Log levels are part of the contract</h2>
+ *
+ * The credential lifecycle — <em>injected</em> into a definition, <em>released</em> from one,
+ * <em>rotated</em> in place — is logged at {@code WARN}. Not because those are failures, but because
+ * they are audit-shaped rather than routine: each one records a plaintext credential being written
+ * into, or dropped from, a live API definition that is then readable at {@code /_node/apis/<id>}.
+ *
+ * <p>The practical consequence matters as much as the principle. The gateway's shipped
+ * {@code logback.xml} keeps {@code <root level="WARN">} and raises only {@code io.gravitee}, so an
+ * {@code INFO} line here is discarded in every default deployment — and the failure mode this
+ * feature has to make detectable is substitution <em>silently stopping</em>, which leaves a
+ * plausible-looking value in place and no error anywhere. A signal that does not survive the default
+ * configuration cannot be monitored for at all, not even by its absence.
+ *
+ * <p>Per-<em>reference</em> detail stays at {@code INFO} — one line per definition is the audit
+ * record, one line per field is chatter. {@code GcpDeployTimeSecretRefsTest} pins both directions, so
+ * quietly demoting a lifecycle line, or promoting the chatter, fails the build.
+ *
  * <h2>The seam</h2>
  *
  * {@code ApiManagerImpl.deploy(api)} publishes {@code SecretDiscoveryEventType.DISCOVER} carrying
@@ -149,6 +168,14 @@ public class GcpDeployTimeSecretRefs
 
     private static final String ENCODING_BASE64 = "base64";
 
+    /**
+     * Every query parameter something in the resolution path actually reads: {@code encoding} here,
+     * {@code version} in {@code GcpSecretLocation}, and {@code keymap}/{@code watch} in
+     * {@code SecretURL}. Anything else is a typo or an overrun match — see
+     * {@link #rejectUnknownQueryParams}.
+     */
+    private static final Set<String> KNOWN_QUERY_PARAMS = Set.of(ENCODING_QUERY_PARAM, "version", "keymap", "watch");
+
     private static final String REFERENCE_SYNTAX = "secret://gcp/<secret>[/<version>]:<key>[?encoding=base64]";
 
     private static final String SECRET_URL_SCHEME = "secret://";
@@ -164,12 +191,27 @@ public class GcpDeployTimeSecretRefs
      * literal text, to travel upstream as a credential and come back as a 401 that names nothing.
      * Matching broadly and rejecting in {@link #resolveReference} is what makes that case loud.
      *
+     * <p>Broad, but not greedy — a reference may be <em>embedded</em> in a larger value, and where it
+     * ends decides what happens to the text after it. Two boundaries are load-bearing, because
+     * overrunning either substitutes the <em>right</em> value into the <em>wrong</em> string, which
+     * nothing downstream can catch:
+     *
+     * <ul>
+     *   <li><b>The path never ends in {@code /}.</b> {@code SecretURL} strips trailing slashes, so a
+     *       trailing one can never belong to the reference — it is the separator before whatever
+     *       follows, as in a {@code dynamic-routing} rule url. Hence segments joined by {@code /},
+     *       rather than a character class that contains it.
+     *   <li><b>{@code &} counts only after a {@code ?}.</b> It separates query parameters, so outside
+     *       a query string it belongs to the surrounding text — a form-encoded
+     *       {@code policy-assign-content} body, say. Hence the separate optional query group.
+     * </ul>
+     *
      * <p>The reference syntax is the {@code gravitee.yml} one, reused rather than invented.
      * Deliberately not the EL {@code {#secrets.get(...)}} form: this runs before any expression
      * language is involved, and the two must stay distinguishable.
      */
     private static final Pattern SECRET_REF_CANDIDATE = Pattern.compile(
-        "secret://(?<provider>[A-Za-z0-9_.-]*)/(?<rest>[A-Za-z0-9_./:?=&%+-]*)"
+        "secret://(?<provider>[A-Za-z0-9_.-]*)/(?<path>[A-Za-z0-9_.:%+-]+(?:/[A-Za-z0-9_.:%+-]+)*)?(?<query>\\?[A-Za-z0-9_.:=&%+-]*)?"
     );
 
     /**
@@ -307,7 +349,7 @@ public class GcpDeployTimeSecretRefs
         });
         rotationChecker.scheduleWithFixedDelay(this::checkForRotations, checkSeconds, checkSeconds, TimeUnit.SECONDS);
 
-        log.info(
+        log.warn(
             "GCP deploy-time secret substitution ACTIVE: '{}' references in API definitions are replaced at deploy time, " +
                 "rotation checked every {}s. The substituted value is readable at /_node/apis/<id> — keep that endpoint authenticated.",
             REFERENCE_SYNTAX,
@@ -353,7 +395,7 @@ public class GcpDeployTimeSecretRefs
          * check identity is what stops the old revision's REVOKE dropping the new entry.
          */
         retained.put(definition, new Retained(definitionObject, definition, event.envId(), revision, found));
-        log.info("Retained {} substitution(s) for {} revision {}", found.size(), definition, forLog(revision));
+        log.warn("Retained {} substitution(s) for {} revision {}", found.size(), definition, forLog(revision));
     }
 
     /**
@@ -386,7 +428,7 @@ public class GcpDeployTimeSecretRefs
                 );
                 return current;
             }
-            log.info(
+            log.warn(
                 "Released {} retained substitution(s) for {}: revision {} supersedes revision {} and references no gcp secret",
                 current.substitutions().size(),
                 definition,
@@ -441,7 +483,7 @@ public class GcpDeployTimeSecretRefs
                 );
                 return current;
             }
-            log.info(
+            log.warn(
                 "Released {} retained substitution(s) for {} revision {}",
                 current.substitutions().size(),
                 definition,
@@ -483,7 +525,7 @@ public class GcpDeployTimeSecretRefs
         if (!changed) {
             return;
         }
-        log.info("Publishing VALUE_CHANGED for {} so it redeploys in place", entry.definition());
+        log.warn("Publishing VALUE_CHANGED for {} so it redeploys in place", entry.definition());
         eventManager.publishEvent(
             SecretDiscoveryEventType.VALUE_CHANGED,
             new SecretDiscoveryEvent(entry.envId(), entry.definition(), new DefinitionMetadata(entry.revision()))
@@ -557,6 +599,7 @@ public class GcpDeployTimeSecretRefs
                 e
             );
         }
+        rejectUnknownQueryParams(secretURL, reference, location);
         Encoding encoding = encodingOf(secretURL, reference, location);
         try {
             /*
@@ -574,6 +617,29 @@ public class GcpDeployTimeSecretRefs
                 "Could not resolve '%s' at %s while substituting an API definition at deploy time".formatted(reference, location),
                 e
             );
+        }
+    }
+
+    /**
+     * Rejects a query parameter nobody consumes.
+     *
+     * <p>{@code SecretURL} parses the query string into a multimap and silently discards what it does
+     * not recognise, so without this a typo would be ignored rather than reported. It also closes a
+     * subtler hole: once a reference carries a {@code ?}, a following {@code &} is a parameter
+     * separator by URL grammar, so a reference with a query string embedded in a form-encoded body
+     * absorbs the {@code &} and everything up to the next character that cannot appear in a query.
+     * That yields an empty-named parameter here, and failing on it turns a silently mangled body into
+     * a failed deployment.
+     */
+    private static void rejectUnknownQueryParams(SecretURL secretURL, String reference, SecretRefsLocation location) {
+        for (String name : secretURL.query().keySet()) {
+            if (!KNOWN_QUERY_PARAMS.contains(name)) {
+                throw new SecretManagerException(
+                    ("'%s' at %s carries the unrecognised query parameter '%s'. Supported: %s. " +
+                        "A reference with a query string must end the value or be followed by something other than '&', " +
+                        "which would otherwise be read as another parameter.").formatted(reference, location, name, KNOWN_QUERY_PARAMS)
+                );
+            }
         }
     }
 

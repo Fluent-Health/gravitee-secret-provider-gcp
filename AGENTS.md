@@ -225,9 +225,9 @@ The shipped `config/logback.xml` sets `io.gravitee` and `com.graviteesource` to 
 discarded in a default gateway — including the deliberate "shim INACTIVE" line whose entire purpose
 is to tell an operator why `#secrets` is not resolving.
 
-Two consequences, both learned the hard way:
+Three consequences, all learned the hard way:
 
-- **A deployment has to add a logger** to see any of it:
+- **A deployment has to add a logger** to see anything at `INFO`:
   ```xml
   <logger name="io.fluenthealth" level="INFO" />
   ```
@@ -235,6 +235,21 @@ Two consequences, both learned the hard way:
   2026-08-31: a probe logging from the constructor — a method `SpringFactoriesLoader` provably calls
   — produced no output either. Absence of our lines says nothing about whether the code ran. Raise
   the level first, then measure.
+- **Anything an operator must see without reconfiguring logging has to be `WARN`.** That is a
+  constraint on the design, not a licence to shout: pick the level by honest severity and then check
+  it clears the root level, rather than promoting a line because it is convenient. Two places have
+  had to make this call, and they went different ways for good reasons:
+  - 1.1.1 put the *misconfiguration* diagnostic at `WARN` — a jar installed in `lib/` doing nothing
+    while `#secrets` fails at request time is genuinely a warning — and deliberately left the
+    positive "shim active" confirmation at `INFO`, because a line in every gateway log to work
+    around a config default was not worth it.
+  - Mode A3 puts the *credential lifecycle* — injected, released, rotated — at `WARN`, on a
+    different argument: those lines are audit-shaped rather than routine, and A3's failure mode is
+    silence rather than a request-time error, so an `INFO` record leaves nothing to monitor even by
+    absence. Per-reference chatter stays `INFO`.
+
+  Both are pinned by tests (`GcpSecretsTemplateVariableProviderStartupTest`,
+  `GcpDeployTimeSecretRefsTest`) so a quiet demotion fails the build.
 
 ## Verified facts about the secret discovery lifecycle (APIM 4.12.12)
 

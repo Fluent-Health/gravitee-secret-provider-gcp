@@ -20,6 +20,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.fluenthealth.gravitee.secretprovider.gcp.core.CachingGcpSecretResolver;
 import io.fluenthealth.gravitee.secretprovider.gcp.core.GcpConfig;
@@ -48,6 +52,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.env.StandardEnvironment;
@@ -89,9 +94,18 @@ class GcpDeployTimeSecretRefsTest {
     private EventManagerImpl eventManager;
     private List<SecretDiscoveryEvent> valueChanged;
     private GcpDeployTimeSecretRefs substituter;
+    private Logger substituterLogger;
+    private ListAppender<ILoggingEvent> logs;
 
     @BeforeEach
     void setUp() {
+        // Attached before arming, so the activation line is captured too.
+        substituterLogger = (Logger) LoggerFactory.getLogger(GcpDeployTimeSecretRefs.class);
+        logs = new ListAppender<>();
+        logs.start();
+        substituterLogger.addAppender(logs);
+        substituterLogger.setLevel(Level.TRACE);
+
         eventManager = new EventManagerImpl();
         valueChanged = new CopyOnWriteArrayList<>();
         eventManager.subscribeForEvents(
@@ -108,6 +122,8 @@ class GcpDeployTimeSecretRefsTest {
     @AfterEach
     void tearDown() {
         substituter.destroy();
+        substituterLogger.detachAppender(logs);
+        logs.stop();
     }
 
     // ── Deploy ────────────────────────────────────────────────────────────────
@@ -222,6 +238,85 @@ class GcpDeployTimeSecretRefsTest {
     }
 
     // ── Nothing is left in place silently ─────────────────────────────────────
+
+    // ── Embedded references: where does a reference end? ──────────────────────
+
+    /**
+     * A reference embedded in a larger value, with path text after it — a {@code dynamic-routing}
+     * rule url.
+     *
+     * <p>The boundary rule is that a reference ends at the last character that could belong to it,
+     * and a trailing {@code /} never can: {@code SecretURL} strips trailing slashes anyway, so one is
+     * always a separator rather than part of the path. Swallowing it would delete a path segment
+     * separator from the url — the value would be right and the route wrong.
+     */
+    @Test
+    void should_stop_a_reference_before_path_text_that_follows_it() {
+        secretValue.set("2f-api-key");
+        TestDefinition definition = new TestDefinition(
+            API_V4,
+            API_ID,
+            configurationWith("{#endpoints['default']}/V1/" + SECRET_REF + "/{#group[0]}")
+        );
+
+        discover(definition, "1");
+
+        assertThat(definition.configuration).contains("{#endpoints['default']}/V1/2f-api-key/{#group[0]}");
+    }
+
+    /**
+     * A reference embedded in a form-encoded body — a {@code policy-assign-content} template.
+     *
+     * <p>{@code &} may only appear inside a query string, so it can only be part of a reference after
+     * a {@code ?}. Treating it as always-part-of-the-reference would eat the parameter separator and
+     * merge two form fields into one, with the correct secret in it — right value, wrong body, no
+     * error. The surrounding {@code $${...}} FreeMarker escape must also survive verbatim.
+     */
+    @Test
+    void should_stop_a_reference_at_a_form_parameter_separator() {
+        secretValue.set("2f-api-key");
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith("apikey=" + SECRET_REF + "&$${request.content}"));
+
+        discover(definition, "1");
+
+        assertThat(definition.configuration).contains("apikey=2f-api-key&$${request.content}");
+    }
+
+    /**
+     * The one embedded shape that is <em>not</em> supported, and the reason it fails loudly instead.
+     *
+     * <p>Once a reference carries a {@code ?}, a following {@code &} is a parameter separator by URL
+     * grammar, so there is no way to tell "end of query string" from "another parameter". The match
+     * absorbs the {@code &}, which yields an empty-named parameter — rejected, rather than silently
+     * eating the separator out of the body.
+     */
+    @Test
+    void should_reject_a_query_string_that_runs_into_the_surrounding_text() {
+        TestDefinition definition = new TestDefinition(
+            API_V4,
+            API_ID,
+            configurationWith("apikey=" + SECRET_REF + "?encoding=base64&$${request.content}")
+        );
+
+        assertThatThrownBy(() -> discover(definition, "1")).hasMessageContaining("unrecognised query parameter");
+    }
+
+    /** A reference that ends the value keeps its query string, which is the ordinary case. */
+    @Test
+    void should_keep_a_query_string_that_ends_the_value() {
+        secretValue.set("2f-api-key");
+
+        TestDefinition definition = deployedWith(SECRET_REF + "?encoding=base64");
+
+        assertThat(definition.configuration).contains(base64("2f-api-key"));
+    }
+
+    @Test
+    void should_reject_a_query_parameter_nobody_reads() {
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith(SECRET_REF + "?encodng=base64"));
+
+        assertThatThrownBy(() -> discover(definition, "1")).hasMessageContaining("encodng");
+    }
 
     /**
      * The incident shape this guards against: a misspelled reference surviving into the deployed
@@ -390,6 +485,76 @@ class GcpDeployTimeSecretRefsTest {
 
         assertThat(revision1.configuration).as("the value in force must stay").contains("secret-value-v1");
         assertThat(valueChanged).isEmpty();
+    }
+
+    // ── Log levels are part of the contract ───────────────────────────────────
+
+    /*
+     * The gateway's shipped logback keeps <root level="WARN"> and raises only io.gravitee, so an INFO
+     * line from this plugin is discarded in every default deployment. The failure this feature has to
+     * make detectable is substitution silently stopping — which leaves a plausible-looking value in
+     * the definition and no error anywhere — and a signal that does not survive the default
+     * configuration cannot be monitored for at all, not even by its absence.
+     *
+     * So the credential lifecycle is WARN and the per-reference chatter is INFO. Both directions are
+     * pinned: demoting a lifecycle line reintroduces the invisible-signal bug, and promoting the
+     * chatter turns WARN into noise, at which point nobody reads it either.
+     */
+
+    @Test
+    void should_log_activation_where_the_gateways_default_logback_can_see_it() {
+        assertThat(levelOf("GCP deploy-time secret substitution ACTIVE")).isEqualTo(Level.WARN);
+    }
+
+    @Test
+    void should_log_an_injected_credential_where_the_gateways_default_logback_can_see_it() {
+        deployed(API_V4, API_ID, "1");
+
+        assertThat(levelOf("Retained 1 substitution(s)")).isEqualTo(Level.WARN);
+    }
+
+    @Test
+    void should_log_a_rotation_where_the_gateways_default_logback_can_see_it() {
+        deployed(API_V4, API_ID, "1");
+
+        rotateTo("secret-value-v2");
+
+        assertThat(levelOf("Publishing VALUE_CHANGED")).isEqualTo(Level.WARN);
+    }
+
+    @Test
+    void should_log_a_release_where_the_gateways_default_logback_can_see_it() {
+        TestDefinition revision1 = deployed(API_V4, API_ID, "1");
+
+        revoke(revision1, "1");
+
+        assertThat(levelOf("Released 1 retained substitution(s)")).isEqualTo(Level.WARN);
+    }
+
+    /** One line per definition is the audit record; one line per field would be noise. */
+    @Test
+    void should_keep_per_reference_detail_below_the_lifecycle_lines() {
+        deployed(API_V4, API_ID, "1");
+        rotateTo("secret-value-v2");
+
+        assertThat(levelOf("Substituted a gcp reference at")).isEqualTo(Level.INFO);
+        assertThat(levelOf("Secret value changed at")).isEqualTo(Level.INFO);
+    }
+
+    private Level levelOf(String messageFragment) {
+        List<ILoggingEvent> matching = logs.list
+            .stream()
+            .filter(event -> event.getFormattedMessage().contains(messageFragment))
+            .toList();
+        assertThat(matching).as("no log line containing '%s'; captured %s", messageFragment, formattedLogs()).isNotEmpty();
+        return matching.getFirst().getLevel();
+    }
+
+    private List<String> formattedLogs() {
+        return logs.list
+            .stream()
+            .map(event -> event.getLevel() + " " + event.getFormattedMessage())
+            .toList();
     }
 
     // ── harness ──────────────────────────────────────────────────────────────

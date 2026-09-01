@@ -271,9 +271,62 @@ The failure this design most wants to avoid is a reference surviving into the de
 | --- | --- |
 | A valid `secret://gcp/...` | Substituted. |
 | A `secret://gcp/...` that cannot be parsed, resolved, or encoded | **The deployment fails**, with an error naming the reference and the plugin whose configuration it was found in. |
-| `secret://<other-provider>/...` | Left alone — this plugin does not own it — but logged at `WARN`, the level that survives the gateway's default `<root level="WARN">` where our `INFO` lines do not. A misspelled provider (`secret://gpc/...`) is the likely cause. |
+| `secret://<other-provider>/...` | Left alone — this plugin does not own it — but logged at `WARN`, so it reaches a default gateway. A misspelled provider (`secret://gpc/...`) is the likely cause. |
 
 This is why the matcher is deliberately generous. A pattern that matched only *valid* references would leave a misspelled one in place, which is exactly the silent case.
+
+### Where a reference ends
+
+A reference does **not** have to be the whole field value — it can be embedded in a larger string, which is what a `dynamic-routing` url or a `policy-assign-content` body needs:
+
+```
+{#endpoints['default']}/V1/secret://gcp/two-factor-api-token:value/{#group[0]}
+apikey=secret://gcp/two-factor-api-token:value&$${request.content}
+```
+
+Both work. The surrounding text — including a `$${...}` FreeMarker escape — is copied through untouched; only the matched reference is replaced.
+
+The boundary rules:
+
+| Rule | |
+| --- | --- |
+| Ends at any character that cannot appear in a secret URL | `"`, whitespace, `{`, `}`, `'`, … |
+| **A trailing `/` is never part of the reference** | `SecretURL` strips trailing slashes, so one can only be the separator before whatever follows |
+| **`&` counts only after a `?`** | outside a query string it separates form parameters |
+| A query string *is* part of the reference | `...:value?encoding=base64` |
+
+The two bolded rules exist because getting them wrong produces the worst failure this feature can: the *correct* secret substituted into a *mangled* string. Eating the `/` breaks the route; eating the `&` merges two form fields. Both were bugs in the first cut of this — right value, wrong string, and nothing downstream can tell.
+
+**The one unsupported shape** is a reference that has a query string *and* is followed by `&`:
+
+```
+apikey=secret://gcp/tok:value?encoding=base64&$${request.content}   # rejected
+```
+
+Once a `?` is present, a following `&` is a parameter separator by URL grammar and cannot be distinguished from another parameter. Rather than guess, the deployment fails with `unrecognised query parameter`. Put the reference last in the value, or drop the query string.
+
+Unknown query parameters are rejected for the same reason: `SecretURL` silently discards what it does not recognise, so `?encodng=base64` would otherwise be ignored. Only `encoding`, `version`, `keymap` and `watch` are accepted.
+
+### The credential lifecycle is logged where you will actually see it
+
+**No logging configuration is required.** The gateway's shipped `logback.xml` keeps `<root level="WARN">` and raises only `io.gravitee`, so mode A3 logs the credential lifecycle at `WARN` and it reaches a default gateway as-is:
+
+| Line | When |
+| --- | --- |
+| `GCP deploy-time secret substitution ACTIVE ...` | once, at startup |
+| `Retained N substitution(s) for Definition[kind=api-v4, id=X] revision R` | a credential was injected into a definition |
+| `Released N retained substitution(s) for ...` | a definition was undeployed or superseded |
+| `Publishing VALUE_CHANGED for ...` | a rotation was propagated in place |
+
+`WARN` is not a claim that these are failures. They are audit-shaped rather than routine — each records a plaintext credential being written into, or dropped from, a live API definition that is then readable at `/_node/apis/<id>` — and the failure this feature has to make detectable is substitution **silently stopping**, which leaves a plausible-looking value in place and no error anywhere. A signal that does not survive the default configuration cannot be monitored for at all, not even by its absence. One line per definition, so the volume is one per API per deploy.
+
+Per-*reference* detail stays at `INFO` — `Substituted a gcp reference at <plugin>` and `Secret value changed at <plugin>`. One line per definition is the audit record; one line per field is chatter. To see those, and the `INACTIVE`/`Ignoring REVOKE` diagnostics at `DEBUG`, add:
+
+```xml
+<logger name="io.fluenthealth" level="DEBUG" />
+```
+
+`GcpDeployTimeSecretRefsTest` pins both directions, so demoting a lifecycle line or promoting the chatter fails the build.
 
 ### `?encoding=base64`
 
