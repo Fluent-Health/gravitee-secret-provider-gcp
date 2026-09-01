@@ -275,6 +275,48 @@ The failure this design most wants to avoid is a reference surviving into the de
 
 This is why the matcher is deliberately generous. A pattern that matched only *valid* references would leave a misspelled one in place, which is exactly the silent case.
 
+### Where a reference ends
+
+A reference does **not** have to be the whole field value — it can be embedded in a larger string, which is what a `dynamic-routing` url or a `policy-assign-content` body needs:
+
+```
+{#endpoints['default']}/V1/secret://gcp/two-factor-api-token:value/{#group[0]}
+apikey=secret://gcp/two-factor-api-token:value&$${request.content}
+```
+
+Both work. The surrounding text — including a `$${...}` FreeMarker escape — is copied through untouched; only the matched reference is replaced.
+
+The boundary rules:
+
+| Rule | |
+| --- | --- |
+| Ends at any character that cannot appear in a secret URL | `"`, whitespace, `{`, `}`, `'`, … |
+| **A trailing `/` is never part of the reference** | `SecretURL` strips trailing slashes, so one can only be the separator before whatever follows |
+| **`&` counts only after a `?`** | outside a query string it separates form parameters |
+| A query string *is* part of the reference | `...:value?encoding=base64` |
+
+The two bolded rules exist because getting them wrong produces the worst failure this feature can: the *correct* secret substituted into a *mangled* string. Eating the `/` breaks the route; eating the `&` merges two form fields. Both were bugs in the first cut of this — right value, wrong string, and nothing downstream can tell.
+
+**The one unsupported shape** is a reference that has a query string *and* is followed by `&`:
+
+```
+apikey=secret://gcp/tok:value?encoding=base64&$${request.content}   # rejected
+```
+
+Once a `?` is present, a following `&` is a parameter separator by URL grammar and cannot be distinguished from another parameter. Rather than guess, the deployment fails with `unrecognised query parameter`. Put the reference last in the value, or drop the query string.
+
+Unknown query parameters are rejected for the same reason: `SecretURL` silently discards what it does not recognise, so `?encodng=base64` would otherwise be ignored. Only `encoding`, `version`, `keymap` and `watch` are accepted.
+
+### Turn this plugin's logs on, or a substitution that stops happening is invisible
+
+Mode A3 logs each substitution and each retained definition at `INFO` under `io.fluenthealth`, and the gateway's shipped `logback.xml` sets `<root level="WARN">` and raises only `io.gravitee` — so by default **a successful substitution prints nothing at all**. Add:
+
+```xml
+<logger name="io.fluenthealth" level="INFO" />
+```
+
+Then a deploy prints `Substituted a gcp reference at ...` and `Retained N substitution(s) for ...`, and a rotation prints `Publishing VALUE_CHANGED for ...`. Without it the only evidence is indirect — no literal `secret://` left at `/_node/apis/<id>` — and a substitution that silently stopped happening would look exactly like one that never ran. The failure cases above are at `WARN` or are exceptions, so those survive the default level either way.
+
 ### `?encoding=base64`
 
 Some fields want the credential base64-encoded rather than raw, and that requirement belongs to the **field**, not to the secret:
