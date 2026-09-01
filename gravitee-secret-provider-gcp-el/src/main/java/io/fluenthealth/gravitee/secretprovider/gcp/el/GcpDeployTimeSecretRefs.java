@@ -29,7 +29,10 @@ import io.gravitee.secrets.api.discovery.SecretRefsLocation;
 import io.gravitee.secrets.api.errors.SecretManagerException;
 import io.gravitee.secrets.api.event.SecretDiscoveryEvent;
 import io.gravitee.secrets.api.event.SecretDiscoveryEventType;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -67,6 +70,29 @@ import org.springframework.core.env.Environment;
  * <p>Substitution rewrites the step's whole raw configuration JSON before the policy deserialises
  * it, so eligibility stops being a per-field question: whatever the policy does with the value
  * afterwards, it sees a plain string.
+ *
+ * <h2>Which references are touched, and what happens to the rest</h2>
+ *
+ * Only {@code secret://gcp/...}. A reference naming another provider is left in place and logged at
+ * {@code WARN}; a {@code gcp} one that cannot be parsed, resolved or encoded fails the deployment.
+ * Nothing is ever left in place <em>silently</em> — a literal reference surviving into a credential
+ * field is answered by the far end with a 401 that names nothing, which is the failure this design
+ * exists to avoid. See {@link #substitute}.
+ *
+ * <h2>The {@code ?encoding=base64} modifier</h2>
+ *
+ * Some fields want the credential encoded rather than raw, and the requirement belongs to the
+ * <em>field</em> rather than to the secret. The motivating case is a JWT plan's
+ * {@code resolverParameter} with {@code publicKeyResolver: GIVEN_KEY}: the policy hands the value to
+ * {@code JWKBuilder.buildHMACKey}, which tries {@code Base64.getDecoder().decode(keyValue)} first and
+ * falls back to {@code keyValue.getBytes()} only when that throws. Passing a raw secret that
+ * <em>happens</em> to be valid base64 therefore yields the decoded bytes as the key, silently, and
+ * every token on that plan is rejected. Encoding first makes the decode branch deterministic, so the
+ * key bytes are exactly the secret's bytes.
+ *
+ * <p>The alternative — storing a second, pre-encoded copy of the credential — works exactly once:
+ * the two copies then have to be rotated together, nothing about either opaque blob reveals that
+ * they have drifted, and the rotation described below would propagate whichever half was updated.
  *
  * <h2>The seam</h2>
  *
@@ -118,14 +144,60 @@ public class GcpDeployTimeSecretRefs
 
     private static final long ROTATION_CHECK_SECONDS_DEFAULT = 60L;
 
-    private static final String REFERENCE_SYNTAX = "secret://gcp/<secret>[/<version>]:<key>";
+    /** Query parameter that transforms the resolved value before it is substituted in. */
+    public static final String ENCODING_QUERY_PARAM = "encoding";
+
+    private static final String ENCODING_BASE64 = "base64";
+
+    private static final String REFERENCE_SYNTAX = "secret://gcp/<secret>[/<version>]:<key>[?encoding=base64]";
+
+    private static final String SECRET_URL_SCHEME = "secret://";
+
+    private static final String GCP_PROVIDER = "gcp";
 
     /**
-     * {@code secret://gcp/<secret>[/<version>]:<key>} — the gravitee.yml reference syntax, reused
-     * rather than inventing a second one. Deliberately not the EL {@code {#secrets.get(...)}} form:
-     * this runs before any expression language is involved and the two must stay distinguishable.
+     * Matches any {@code secret://<provider>/...} run, deliberately — <em>not</em> only a well-formed
+     * gcp one.
+     *
+     * <p>A pattern that matched only valid references would leave a misspelled one
+     * ({@code secret://gpc/...}, {@code ?encodng=base64}) sitting in the deployed definition as
+     * literal text, to travel upstream as a credential and come back as a 401 that names nothing.
+     * Matching broadly and rejecting in {@link #resolveReference} is what makes that case loud.
+     *
+     * <p>The reference syntax is the {@code gravitee.yml} one, reused rather than invented.
+     * Deliberately not the EL {@code {#secrets.get(...)}} form: this runs before any expression
+     * language is involved, and the two must stay distinguishable.
      */
-    private static final Pattern SECRET_REF = Pattern.compile("secret://gcp/[A-Za-z0-9_./-]+(?::[A-Za-z0-9_.-]+)?");
+    private static final Pattern SECRET_REF_CANDIDATE = Pattern.compile(
+        "secret://(?<provider>[A-Za-z0-9_.-]*)/(?<rest>[A-Za-z0-9_./:?=&%+-]*)"
+    );
+
+    /**
+     * What {@code ?encoding=} does to a resolved value before it is written into the definition.
+     *
+     * <p>The encoding belongs to the <em>field</em>, not to the secret, which is why it lives on the
+     * reference rather than in Secret Manager. Storing a second, pre-encoded copy of a credential
+     * would work exactly once: the two copies then have to be rotated together, and nothing about
+     * either blob reveals that they have drifted apart. See the README for the case that motivated
+     * this — a JWT plan's {@code resolverParameter}.
+     */
+    private enum Encoding {
+        NONE {
+            @Override
+            String apply(String value) {
+                return value;
+            }
+        },
+        /** Explicit UTF-8, so the result cannot depend on the gateway's platform default charset. */
+        BASE64 {
+            @Override
+            String apply(String value) {
+                return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+            }
+        };
+
+        abstract String apply(String value);
+    }
 
     private static final Logger log = LoggerFactory.getLogger(GcpDeployTimeSecretRefs.class);
 
@@ -258,10 +330,14 @@ public class GcpDeployTimeSecretRefs
 
         List<Substitution> found = new ArrayList<>();
         finder.findSecretRefs(definitionObject, (payload, location, setter) -> {
-            if (payload == null || !SECRET_REF.matcher(payload).find()) {
+            if (payload == null || !payload.contains(SECRET_URL_SCHEME)) {
                 return;
             }
             String substituted = substitute(payload, location);
+            if (substituted.equals(payload)) {
+                // Only references belonging to another provider, which substitute() has warned about.
+                return;
+            }
             setter.accept(substituted);
             found.add(new Substitution(location, payload, setter, substituted));
             log.info("Substituted a gcp reference at {}", location);
@@ -417,19 +493,45 @@ public class GcpDeployTimeSecretRefs
     // ── Resolution ────────────────────────────────────────────────────────────
 
     /**
-     * Replaces every reference in a raw configuration payload with its resolved value.
+     * Replaces every {@code gcp} reference in a raw configuration payload with its resolved value.
      *
-     * <p>A resolution failure is deliberately not swallowed. On the DISCOVER path it propagates out
-     * of {@code ApiManagerImpl.deploy}/{@code update} and fails that API's deployment, which is the
-     * safe outcome — the alternative is an API served with a literal {@code secret://gcp/...} in a
-     * credential field. On the rotation path {@link #checkForRotations()} logs it and the value
-     * already in force stays.
+     * <p>Nothing here is swallowed, because every silent outcome is worse than a failed deployment:
+     *
+     * <ul>
+     *   <li>A <b>malformed gcp reference</b> — a bad URL, an unknown {@code ?encoding}, a secret that
+     *       cannot be read — throws. On the DISCOVER path that propagates out of
+     *       {@code ApiManagerImpl.deploy}/{@code update} and fails that API's deployment. The
+     *       alternative is an API served with a literal {@code secret://gcp/...} in a credential
+     *       field, which the far end answers with a 401 and nobody notices.
+     *   <li>A reference for <b>another provider</b> is left alone — this plugin does not own it — but
+     *       logged at {@code WARN}, which survives the gateway's default {@code <root level="WARN">}
+     *       where our {@code INFO} lines do not. A misspelled provider is the likely cause, and that
+     *       is the one case that would otherwise stay invisible.
+     * </ul>
+     *
+     * <p>On the rotation path {@link #checkForRotations()} catches and logs, and the value already in
+     * force stays.
      */
     private String substitute(String payload, SecretRefsLocation location) {
-        Matcher matcher = SECRET_REF.matcher(payload);
+        Matcher matcher = SECRET_REF_CANDIDATE.matcher(payload);
         StringBuilder out = new StringBuilder();
         while (matcher.find()) {
-            String value = resolve(matcher.group(), location);
+            String reference = matcher.group();
+            if (!GCP_PROVIDER.equalsIgnoreCase(matcher.group("provider"))) {
+                /*
+                 * Skipping the match entirely is safe: the next appendReplacement copies everything
+                 * from the current append position, which includes this text verbatim.
+                 */
+                log.warn(
+                    "Leaving '{}' at {} untouched — this plugin only substitutes '{}' references. " +
+                        "If that was meant to be one, it is misspelled and is now literal text in the deployed definition.",
+                    reference,
+                    location,
+                    SECRET_URL_SCHEME + GCP_PROVIDER + "/"
+                );
+                continue;
+            }
+            String value = resolveReference(reference, location);
             // The payload is JSON and the value lands inside a JSON string literal, so a quote or
             // backslash in a secret would otherwise break out of it.
             matcher.appendReplacement(out, Matcher.quoteReplacement(escapeForJsonStringBody(value)));
@@ -438,9 +540,24 @@ public class GcpDeployTimeSecretRefs
         return out.toString();
     }
 
-    private String resolve(String reference, SecretRefsLocation location) {
+    private String resolveReference(String reference, SecretRefsLocation location) {
         // secret://gcp/... -> /gcp/..., the URI form SecretURL.from expects.
-        String uri = reference.substring("secret:/".length());
+        String uri = reference.substring(SECRET_URL_SCHEME.length() - 1);
+        SecretURL secretURL;
+        try {
+            secretURL = SecretURL.from(uri, true);
+        } catch (RuntimeException e) {
+            throw new SecretManagerException(
+                "'%s' at %s is not a usable secret reference: %s. Expected '%s'.".formatted(
+                    reference,
+                    location,
+                    e.getMessage(),
+                    REFERENCE_SYNTAX
+                ),
+                e
+            );
+        }
+        Encoding encoding = encodingOf(secretURL, reference, location);
         try {
             /*
              * blockingGet is correct here and only here. Deploy-time substitution runs on an
@@ -449,7 +566,7 @@ public class GcpDeployTimeSecretRefs
              * defer to. Request-time resolution is the opposite case, which is why GcpSecretsElHolder
              * returns Single.
              */
-            return resolver().resolveKey(SecretURL.from(uri, true)).blockingGet();
+            return encoding.apply(resolver().resolveKey(secretURL).blockingGet());
         } catch (RuntimeException e) {
             // Name the location. Without it the failure reads as a bare "secret not found" against a
             // definition whose reference could be in any of a dozen plugin configurations.
@@ -458,6 +575,45 @@ public class GcpDeployTimeSecretRefs
                 e
             );
         }
+    }
+
+    /**
+     * Reads {@code ?encoding=} off a reference.
+     *
+     * <p>The query string is parsed by {@link SecretURL} itself and unknown parameters are ignored
+     * there, which is what lets a modifier live in the syntax the platform already defines —
+     * {@code keymap}, {@code watch} and this repo's own {@code version} are the same shape. It also
+     * means an unknown parameter would be silently discarded, so the value is validated here rather
+     * than left to a default.
+     */
+    private static Encoding encodingOf(SecretURL secretURL, String reference, SecretRefsLocation location) {
+        Collection<String> requested = secretURL.query().get(ENCODING_QUERY_PARAM);
+        if (requested.isEmpty()) {
+            return Encoding.NONE;
+        }
+        if (requested.size() > 1) {
+            throw new SecretManagerException(
+                "'%s' at %s sets '%s' %d times; it may be set at most once".formatted(
+                    reference,
+                    location,
+                    ENCODING_QUERY_PARAM,
+                    requested.size()
+                )
+            );
+        }
+        String encoding = requested.iterator().next().trim();
+        if (ENCODING_BASE64.equalsIgnoreCase(encoding)) {
+            return Encoding.BASE64;
+        }
+        throw new SecretManagerException(
+            "'%s' at %s asks for %s='%s', which is not supported. The only supported value is '%s'.".formatted(
+                reference,
+                location,
+                ENCODING_QUERY_PARAM,
+                encoding,
+                ENCODING_BASE64
+            )
+        );
     }
 
     private synchronized CachingGcpSecretResolver resolver() {

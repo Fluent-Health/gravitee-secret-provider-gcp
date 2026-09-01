@@ -278,6 +278,36 @@ extended to shared policy groups from this side.
 `ApiManagerImpl` lines for a rotation appear on `gcp-deploytime-rotation`, this plugin's own thread.
 That is what makes substituting before deployment work at all.
 
+### A JWT `GIVEN_KEY` HMAC secret must be base64, and the reason is a silent fallback
+
+`gravitee-policy-jwt`'s `JWKBuilder.buildHMACKey` is:
+
+```java
+byte[] key;
+try {
+    key = Base64.getDecoder().decode(keyValue);
+} catch (IllegalArgumentException e) {
+    key = keyValue.getBytes();
+}
+```
+
+It base64-decodes if it can, and falls back to the raw bytes only when that throws. So a raw secret
+that *happens* to be valid base64 — plenty of alphanumeric secrets of the right length are — silently
+becomes the decoded bytes, and every token on that plan is rejected with nothing logged. A
+`base64encode(...)` around this value is **load-bearing disambiguation**, not decoration: do not
+"simplify" it away.
+
+Two consequences worth holding on to:
+
+- It is HMAC-specific. `buildRSAKey` uses the value as a PEM or `ssh-rsa` string, where
+  base64-encoding it would break the key. The encoding is a property of the *field*, not of the
+  secret — which is why mode A3 expresses it as `?encoding=base64` on the reference rather than
+  expecting a second, pre-encoded secret to be stored alongside the first.
+- The field is deploy-time-only regardless. `DefaultJWTProcessorProvider.provide()` reads
+  `resolverParameter` with `ctx.getTemplateEngine().getValue(...)`, and the v3
+  `TemplatableSignatureKeyResolver` does the same, so a request-time reference resolves to the
+  literal expression text.
+
 ### The local API registry: only ENTRY_CREATE is usable for a V4 API
 
 `services.sync.local.enabled: true` plus `services.sync.local.path` is the cheap way to get a

@@ -38,6 +38,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +74,7 @@ class GcpDeployTimeSecretRefsTest {
     private static final String API_ID = "deploy-time-unit";
     private static final String SECRET_REF = "secret://gcp/deploy-time-secret:value";
     private static final String ENV_ID = "DEFAULT";
+    private static final String ENCODING_BASE64 = "base64";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -158,6 +160,104 @@ class GcpDeployTimeSecretRefsTest {
 
         String value = MAPPER.readTree(definition.configuration).get("addHeaders").get(0).get("value").asText();
         assertThat(value).isEqualTo("a\"b\\c\td");
+    }
+
+    // ── The ?encoding= modifier ───────────────────────────────────────────────
+
+    /**
+     * The motivating case: a JWT plan's {@code resolverParameter}, where {@code JWKBuilder} tries
+     * {@code Base64.getDecoder().decode(keyValue)} first and only falls back to raw bytes when that
+     * throws — so a raw secret that happens to be valid base64 silently becomes the decoded bytes.
+     */
+    @Test
+    void should_base64_encode_the_resolved_value_when_the_reference_asks_for_it() {
+        secretValue.set("hmac-signing-key");
+
+        TestDefinition definition = deployedWith(SECRET_REF + "?encoding=base64");
+
+        assertThat(definition.configuration).contains(base64("hmac-signing-key")).doesNotContain("hmac-signing-key");
+    }
+
+    /** The encoding belongs to the field, so one stored secret has to be able to serve both forms. */
+    @Test
+    void should_encode_only_the_reference_that_asks_and_leave_a_sibling_raw() {
+        secretValue.set("shared-key");
+        TestDefinition definition = new TestDefinition(
+            API_V4,
+            API_ID,
+            "{\"raw\":\"%s\",\"encoded\":\"%s?encoding=base64\"}".formatted(SECRET_REF, SECRET_REF)
+        );
+
+        discover(definition, "1");
+
+        assertThat(definition.configuration).isEqualTo("{\"raw\":\"shared-key\",\"encoded\":\"%s\"}".formatted(base64("shared-key")));
+    }
+
+    /** A rotation has to carry the encoding with it, or the field reverts to raw on the next change. */
+    @Test
+    void should_keep_the_encoding_across_a_rotation() {
+        secretValue.set("key-v1");
+        TestDefinition definition = deployedWith(SECRET_REF + "?encoding=base64");
+
+        rotateTo("key-v2");
+
+        assertThat(definition.configuration).contains(base64("key-v2"));
+        assertThat(valueChanged).hasSize(1);
+    }
+
+    @Test
+    void should_reject_an_encoding_it_does_not_support() {
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith(SECRET_REF + "?encoding=hex"));
+
+        assertThatThrownBy(() -> discover(definition, "1"))
+            .hasMessageContaining("encoding='hex'")
+            .hasMessageContaining(ENCODING_BASE64);
+    }
+
+    @Test
+    void should_reject_an_encoding_set_more_than_once() {
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith(SECRET_REF + "?encoding=base64&encoding=base64"));
+
+        assertThatThrownBy(() -> discover(definition, "1")).hasMessageContaining("at most once");
+    }
+
+    // ── Nothing is left in place silently ─────────────────────────────────────
+
+    /**
+     * The incident shape this guards against: a misspelled reference surviving into the deployed
+     * definition as literal text, travelling upstream as a credential, and coming back as a 401 that
+     * names nothing. A pattern matching only <em>valid</em> references would do exactly that.
+     */
+    @Test
+    void should_reject_a_gcp_reference_it_cannot_parse() {
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith("secret://gcp/"));
+
+        assertThatThrownBy(() -> discover(definition, "1"))
+            .hasMessageContaining("secret://gcp/")
+            .hasMessageContaining("transform-headers");
+    }
+
+    @Test
+    void should_reject_a_gcp_reference_whose_path_is_not_a_gcp_location() {
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith("secret://gcp/project/secret/version:value"));
+
+        assertThatThrownBy(() -> discover(definition, "1")).hasMessageContaining("transform-headers");
+    }
+
+    /**
+     * A reference naming another provider is not ours to resolve, so it is left alone rather than
+     * failing someone else's working gateway — but it must not vanish into the noise either, which is
+     * why it is logged at WARN, the level that survives the gateway's default {@code root=WARN}.
+     */
+    @Test
+    void should_leave_another_providers_reference_in_place_and_retain_nothing() {
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith("secret://kubernetes/tls:crt"));
+
+        discover(definition, "1");
+        rotateTo("secret-value-v2");
+
+        assertThat(definition.configuration).contains("secret://kubernetes/tls:crt");
+        assertThat(valueChanged).as("nothing of ours was substituted, so nothing may be retained").isEmpty();
     }
 
     // ── Revoke ────────────────────────────────────────────────────────────────
@@ -294,6 +394,17 @@ class GcpDeployTimeSecretRefsTest {
         TestDefinition definition = new TestDefinition(kind, id, configurationWith(SECRET_REF));
         discover(definition, revision);
         return definition;
+    }
+
+    /** Deploys revision 1 of an API whose one field carries the given reference verbatim. */
+    private TestDefinition deployedWith(String reference) {
+        TestDefinition definition = new TestDefinition(API_V4, API_ID, configurationWith(reference));
+        discover(definition, "1");
+        return definition;
+    }
+
+    private static String base64(String value) {
+        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
     }
 
     private void discover(TestDefinition definition, String revision) {

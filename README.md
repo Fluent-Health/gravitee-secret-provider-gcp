@@ -86,6 +86,8 @@ secrets:
 | `deployTime.enabled` | `false` | Activates mode A3. With it `false` the substituter subscribes to nothing and starts no thread, so 1.1.x behaviour is unchanged. |
 | `deployTime.rotationCheckSeconds` | `60` | How often mode A3 re-resolves what it substituted. Independent of `secretTtlSeconds`, and pointless below it — the resolver cache would answer from memory. |
 
+Mode A3 also accepts one modifier on a reference, `?encoding=base64` — see [that section](#encodingbase64).
+
 ### IAM
 
 The gateway authenticates as its Workload Identity service account — no static key material. Grant it read access to each secret:
@@ -259,7 +261,45 @@ secret://gcp/db-credentials:password
 secret://gcp/upstream/2:token
 ```
 
-Note this is **not** the `{#secrets.get(...)}` form. The two are deliberately distinguishable: one is substituted before deployment, the other evaluated per request.
+Note this is **not** the `{#secrets.get(...)}` form. The two are deliberately distinguishable: one is substituted before deployment, the other evaluated per request. Mode A3 never touches an EL expression and mode A2 never touches a `secret://` reference, so `#secrets.get(...)` and `#secrets.basic(...)` behave identically whether A3 is on or off — and there is no deploy-time equivalent of them.
+
+### Nothing is left in place silently
+
+The failure this design most wants to avoid is a reference surviving into the deployed definition as literal text, travelling upstream as a credential, and coming back as a `401` that names nothing. So:
+
+| What is in the field | What happens |
+| --- | --- |
+| A valid `secret://gcp/...` | Substituted. |
+| A `secret://gcp/...` that cannot be parsed, resolved, or encoded | **The deployment fails**, with an error naming the reference and the plugin whose configuration it was found in. |
+| `secret://<other-provider>/...` | Left alone — this plugin does not own it — but logged at `WARN`, the level that survives the gateway's default `<root level="WARN">` where our `INFO` lines do not. A misspelled provider (`secret://gpc/...`) is the likely cause. |
+
+This is why the matcher is deliberately generous. A pattern that matched only *valid* references would leave a misspelled one in place, which is exactly the silent case.
+
+### `?encoding=base64`
+
+Some fields want the credential base64-encoded rather than raw, and that requirement belongs to the **field**, not to the secret:
+
+```
+secret://gcp/jwt-signing-key:value?encoding=base64
+```
+
+The motivating case is a JWT plan's `resolverParameter` with `publicKeyResolver: GIVEN_KEY`. That field cannot use a request-time reference at all — `DefaultJWTProcessorProvider` reads it with `getValue`, which is synchronous — so it is deploy-time-only. And it needs the encoding, because `JWKBuilder.buildHMACKey` does:
+
+```java
+try {
+    key = Base64.getDecoder().decode(keyValue);
+} catch (IllegalArgumentException e) {
+    key = keyValue.getBytes();
+}
+```
+
+It base64-decodes if it can and falls back to raw bytes only when that throws. Pass a raw secret that *happens* to be valid base64 — plenty of alphanumeric secrets are — and the key silently becomes the decoded bytes, so every token on that plan is rejected with nothing logged. Encoding first makes the decode branch deterministic, so the key bytes are exactly the secret's bytes.
+
+> This is HMAC-specific. `buildRSAKey` uses the value as a PEM or `ssh-rsa` string, where base64-encoding it would break the key. The encoding really is per-field, which is the point.
+
+**Why a modifier rather than a second, pre-encoded secret.** Storing both works exactly once: the two copies then have to be rotated together, nothing about either opaque blob reveals that they have drifted, and A3's rotation would faithfully propagate whichever half was updated. One secret, encoded at the point of use, keeps rotation atomic.
+
+The modifier is a query parameter because `SecretURL` already parses the query string, and this repo already uses it for `version` (`secret://gcp/my-secret:key?version=3`) as Gravitee does for `keymap` and `watch`. No new grammar. `encoding` may be set at most once, `base64` is its only supported value, and anything else fails the deployment rather than being ignored — `SecretURL` silently discards unknown parameters, so an unvalidated typo would go unnoticed.
 
 ### Rotation works without a gateway restart
 
@@ -309,6 +349,7 @@ The original `secret://gcp/...` reference is gone from that output — it has be
 - **It is not licence-portable.** The enterprise `service-secrets` plugin has no deploy-time substitution, so a definition relying on A3 has to be rewritten before switching to mode B.
 - **Two caches, not one.** A3 builds its own resolver, separate from the A2 shim's, so a secret used by both is fetched by both. At one fetch per TTL per secret that is not worth sharing state for.
 - **The secret lands in JSON.** Quotes, backslashes and control characters are escaped so a value cannot break out of the string literal it is substituted into. Nothing else about the value is validated.
+- **`base64` is the only encoding.** There is deliberately no general transform grammar. If a field ever needs a finished `Basic` credential the way `#secrets.basic(...)` provides one at request time, the modifier slot is where it would go — but the shape should be settled against a real call site, not guessed at now.
 
 ## Rotation
 
