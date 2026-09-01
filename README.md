@@ -4,15 +4,18 @@ Load Gravitee APIM secrets straight out of **GCP Secret Manager**, instead of mi
 
 A project by [Fluent Health](https://github.com/Fluent-Health).
 
-Two ways to consume it, from one GCP client:
+Ways to consume it, from one GCP client:
 
 | Mode | Looks like | Licence | What resolves it |
 | --- | --- | --- | --- |
 | **A1** — configuration references | `secret://gcp/db-password:password` in `gravitee.yml` | none | OSS `GraviteeConfigurationSecretResolver`, at startup |
 | **A2** — API definitions | `{#secrets.get('/gcp/db-password:password')}` | none | the EL shim in this repo, at request time |
+| **A3** — API definitions, deploy time | `secret://gcp/db-password:password` in an API definition | none | the deploy-time substituter in this repo, **when the API deploys** |
 | **B** — API definitions, enterprise | `{#secrets.get('/gcp/db-password:password')}` | **yes** | Gravitee's `service-secrets` plugin |
 
 Modes A2 and B use **identical syntax**, so acquiring a licence is a deployment change — install the enterprise plugin, switch the shim off — and touches no API definition. See [Switching between A2 and B](#switching-between-a2-and-b).
+
+**A2 is the default choice.** A3 exists only for policy fields that no expression language can reach, and it puts the resolved value inside the definition the gateway holds — see [Mode A3](#mode-a3--api-definitions-deploy-time), which is explicit about that cost. It is off unless you turn it on.
 
 ## Compatibility
 
@@ -24,6 +27,7 @@ Everything the plugin compiles against is `provided` — supplied by the gateway
 | --- | --- |
 | `io.gravitee.secret:gravitee-secret-api` | `3.0.0` |
 | `io.gravitee.el:gravitee-expression-language` | `4.4.0` |
+| `io.gravitee.common:gravitee-common` | `5.0.0` |
 | Vert.x | `5.0.12` |
 | RxJava | `3.1.12` |
 
@@ -50,7 +54,7 @@ Mode A1 needs only the ZIP. Mode A2 needs both — the ZIP resolves nothing at r
 
 ## Configuration
 
-Under `secrets.gcp` in `gravitee.yml` (or as `GRAVITEE_SECRETS_GCP_*` environment variables). Both modes read the same block, deliberately, so they cannot drift apart.
+Under `secrets.gcp` in `gravitee.yml` (or as `GRAVITEE_SECRETS_GCP_*` environment variables). Every mode reads the same block, deliberately, so they cannot drift apart.
 
 ```yaml
 secrets:
@@ -64,6 +68,9 @@ secrets:
     # serviceAccountKeyFile: /etc/gcp/sa.json   # LOCAL DEVELOPMENT ONLY
     el:
       enabled: true # mode A2 only; off by default
+    deployTime:
+      enabled: false # mode A3 only; off by default. Read the section first.
+      rotationCheckSeconds: 60
 ```
 
 | Property | Default | Notes |
@@ -76,6 +83,10 @@ secrets:
 | `requestTimeoutMs` | `5000` | |
 | `serviceAccountKeyFile` | — | Local development only. When unset, Workload Identity is used. |
 | `el.enabled` | `false` | Activates the mode A2 shim. Requires the whitelist entries below. |
+| `deployTime.enabled` | `false` | Activates mode A3. With it `false` the substituter subscribes to nothing and starts no thread, so 1.1.x behaviour is unchanged. |
+| `deployTime.rotationCheckSeconds` | `60` | How often mode A3 re-resolves what it substituted. Independent of `secretTtlSeconds`, and pointless below it — the resolver cache would answer from memory. |
+
+Mode A3 also accepts one modifier on a reference, `?encoding=base64` — see [that section](#encodingbase64).
 
 ### IAM
 
@@ -207,6 +218,139 @@ This shim instead returns `Single<String>`, which the template engine resolves w
 - **URIs only, not names.** The enterprise service also resolves bare names against secret specs managed in the console. There is no spec registry here, so a non-URI argument is rejected with an explanatory error rather than guessed at.
 - **No ACLs and no console UI** for secret specs. Access control is IAM on the GCP side.
 
+## Mode A3 — API definitions, deploy time
+
+**Off by default. Turn it on only for the fields mode A2 cannot reach, and read the exposure section below before you do.**
+
+### The problem it solves
+
+A request-time reference resolves only in a field the policy hands to `TemplateEngine.eval()`. That is the one entry point able to await a deferred value; `getValue`, `convert` and `evalNow` are synchronous and cannot. Several upstream policies never call `eval` on the field at all:
+
+| Policy | Field | What it does instead |
+| --- | --- | --- |
+| `policy-generate-jwt` | `content` (the HMAC secret) | `new MACSigner(configuration.getContent())` — the raw string |
+| `policy-request-validation` | ENUM constraint parameters | mapped through `templateEngine::convert` |
+| `dynamic-routing` | rule `url` | `getValue` only |
+| `policy-assign-content` | body | FreeMarker, not EL |
+
+For those, no `{#secrets.get(...)}` will ever work — the policy sees the expression text, or a mangled fragment, and the far end answers 401 or 400 with nothing logged.
+
+Mode A3 replaces the reference **inside the API definition, before the policy deserialises it**. It rewrites the whole raw configuration JSON of each plugin step, so eligibility stops being a per-field question: the policy receives a plain string whatever it does with it.
+
+### Turning it on
+
+Install the same artifacts as mode A2 (the plugin ZIP, plus both jars in `lib/`), then:
+
+```yaml
+secrets:
+  gcp:
+    enabled: true
+    projectId: my-gcp-project
+    deployTime:
+      enabled: true
+      rotationCheckSeconds: 60
+```
+
+No `el.whitelist` entries are needed — no expression language is involved. A3 and A2 can be on at once and are independent.
+
+Then, in the API definition, use the same syntax as `gravitee.yml`:
+
+```
+secret://gcp/jwt-signing-key:value
+secret://gcp/db-credentials:password
+secret://gcp/upstream/2:token
+```
+
+Note this is **not** the `{#secrets.get(...)}` form. The two are deliberately distinguishable: one is substituted before deployment, the other evaluated per request. Mode A3 never touches an EL expression and mode A2 never touches a `secret://` reference, so `#secrets.get(...)` and `#secrets.basic(...)` behave identically whether A3 is on or off — and there is no deploy-time equivalent of them.
+
+### Nothing is left in place silently
+
+The failure this design most wants to avoid is a reference surviving into the deployed definition as literal text, travelling upstream as a credential, and coming back as a `401` that names nothing. So:
+
+| What is in the field | What happens |
+| --- | --- |
+| A valid `secret://gcp/...` | Substituted. |
+| A `secret://gcp/...` that cannot be parsed, resolved, or encoded | **The deployment fails**, with an error naming the reference and the plugin whose configuration it was found in. |
+| `secret://<other-provider>/...` | Left alone — this plugin does not own it — but logged at `WARN`, the level that survives the gateway's default `<root level="WARN">` where our `INFO` lines do not. A misspelled provider (`secret://gpc/...`) is the likely cause. |
+
+This is why the matcher is deliberately generous. A pattern that matched only *valid* references would leave a misspelled one in place, which is exactly the silent case.
+
+### `?encoding=base64`
+
+Some fields want the credential base64-encoded rather than raw, and that requirement belongs to the **field**, not to the secret:
+
+```
+secret://gcp/jwt-signing-key:value?encoding=base64
+```
+
+The motivating case is a JWT plan's `resolverParameter` with `publicKeyResolver: GIVEN_KEY`. That field cannot use a request-time reference at all — `DefaultJWTProcessorProvider` reads it with `getValue`, which is synchronous — so it is deploy-time-only. And it needs the encoding, because `JWKBuilder.buildHMACKey` does:
+
+```java
+try {
+    key = Base64.getDecoder().decode(keyValue);
+} catch (IllegalArgumentException e) {
+    key = keyValue.getBytes();
+}
+```
+
+It base64-decodes if it can and falls back to raw bytes only when that throws. Pass a raw secret that *happens* to be valid base64 — plenty of alphanumeric secrets are — and the key silently becomes the decoded bytes, so every token on that plan is rejected with nothing logged. Encoding first makes the decode branch deterministic, so the key bytes are exactly the secret's bytes.
+
+> This is HMAC-specific. `buildRSAKey` uses the value as a PEM or `ssh-rsa` string, where base64-encoding it would break the key. The encoding really is per-field, which is the point.
+
+**Why a modifier rather than a second, pre-encoded secret.** Storing both works exactly once: the two copies then have to be rotated together, nothing about either opaque blob reveals that they have drifted, and A3's rotation would faithfully propagate whichever half was updated. One secret, encoded at the point of use, keeps rotation atomic.
+
+The modifier is a query parameter because `SecretURL` already parses the query string, and this repo already uses it for `version` (`secret://gcp/my-secret:key?version=3`) as Gravitee does for `keymap` and `watch`. No new grammar. `encoding` may be set at most once, `base64` is its only supported value, and anything else fails the deployment rather than being ignored — `SecretURL` silently discards unknown parameters, so an unvalidated typo would go unnoticed.
+
+### Rotation works without a gateway restart
+
+Measured against `graviteeio/apim-gateway:4.12.12` with a real deployed API, not reasoned from source. Every `rotationCheckSeconds` the retained references are re-resolved; where a value moved it is written back through the setter the discovery SPI handed over and `VALUE_CHANGED` is published, which makes `ApiManagerImpl` fire `ReactorEvent.UPDATE` for the api object it already holds:
+
+```
+[graviteeio-node] Substituted a gcp reference at SecretRefsLocation[kind=plugin, id=transform-headers]
+[graviteeio-node] Retained 1 substitution(s) for Definition[kind=api-v4, id=deploy-time-revoke] revision 1
+[graviteeio-node] ApiManagerImpl - API id[deploy-time-revoke] revision[1] has been deployed
+-- value changed in Secret Manager --
+[gcp-deploytime-rotation] Publishing VALUE_CHANGED for Definition[kind=api-v4, id=deploy-time-revoke] so it redeploys in place
+[gcp-deploytime-rotation] ApiManagerImpl - Secret value changed for API deploy-time-revoke, updating it
+[gcp-deploytime-rotation] ApiManagerImpl - API id[deploy-time-revoke] revision[2] has been updated
+```
+
+One startup line in the whole run, one `/_node` identity throughout, the API updated in place and never re-registered, and the request after the rotation carrying the new value. `GcpDeployTimeSubstitutionIT` is that measurement.
+
+A redeploy and an undeploy were measured too, by `GcpDeployTimeRevocationIT`, because the gateway publishes `DISCOVER` for the new revision **before** `REVOKE` for the previous one — so a superseded revision's revocation must not release what the live revision needs, and an undeploy must release it:
+
+```
+Retained 1 substitution(s) for Definition[kind=api-v4, id=deploy-time-revoke] revision 2
+Ignoring REVOKE of Definition[kind=api-v4, id=deploy-time-revoke] revision 1; it is superseded by the retained revision 2
+API id[deploy-time-revoke] revision[2] has been updated
+-- value changed: rotation still reaches revision 2 --
+Released 1 retained substitution(s) for Definition[kind=api-v4, id=deploy-time-revoke] revision 2
+API id[deploy-time-revoke] revision[2] has been undeployed
+-- value changed: nothing further is published for this api --
+```
+
+### The cost: the substituted value is readable at `/_node/apis/<id>`
+
+Also measured. Once substituted, the plaintext is what the gateway holds, and `ApiManagementEndpoint` serialises the definition verbatim:
+
+```json
+"policy": "transform-headers",
+"configuration": { "addHeaders": [{ "name": "X-Injected-Credential", "value": "the-actual-secret" }] }
+```
+
+The original `secret://gcp/...` reference is gone from that output — it has been replaced, not annotated.
+
+> **Keep the node API authenticated.** The shipped `gravitee.yml` already binds `services.core.http` to `host: localhost` with `authentication.type: basic`, which is why the integration test has to set `host: 0.0.0.0` and `authentication.type: none` to read it at all. If you have widened that binding for probes or scraping, put credentials back on it before enabling mode A3. Mode A2 has no equivalent exposure, because nothing is ever written into the definition.
+
+### Limitations of mode A3
+
+- **A resolution failure fails the deployment.** The exception propagates out of `ApiManagerImpl.deploy`/`update`, so an API whose secret cannot be read does not deploy. This is deliberate: the alternative is serving a literal `secret://gcp/...` in a credential field. Rotation failures are different — they are logged and the value already in force stays.
+- **In-place rotation covers V4 APIs only.** `ApiManagerImpl` acts on `VALUE_CHANGED` for the `api-v4` and `native-api-v4` definition kinds and ignores the rest. A reference in another kind of definition is still substituted at deploy time, but a later value change reaches it only when that definition is itself redeployed.
+- **It is not licence-portable.** The enterprise `service-secrets` plugin has no deploy-time substitution, so a definition relying on A3 has to be rewritten before switching to mode B.
+- **Two caches, not one.** A3 builds its own resolver, separate from the A2 shim's, so a secret used by both is fetched by both. At one fetch per TTL per secret that is not worth sharing state for.
+- **The secret lands in JSON.** Quotes, backslashes and control characters are escaped so a value cannot break out of the string literal it is substituted into. Nothing else about the value is validated.
+- **`base64` is the only encoding.** There is deliberately no general transform grammar. If a field ever needs a finished `Basic` credential the way `#secrets.basic(...)` provides one at request time, the modifier slot is where it would go — but the shape should be settled against a real call site, not guessed at now.
+
 ## Rotation
 
 Point at `latest` (the default) and rotation needs no redeploy:
@@ -221,7 +365,9 @@ Two things worth knowing:
 - **An explicitly pinned version never expires.** GCP secret versions are immutable, so there is nothing to re-read. Pinning also means every rotation becomes an API-definition change — which is why `latest` is the default.
 - **`watch()` is a logged no-op.** GCP has no watch API: versions are immutable and creating one emits no subscribable signal. TTL-driven re-resolution is the mechanism, and the SPI requires `watch()` not to signal an error.
 
-> **Mode A1 resolves at startup and caches for the lifetime of the process.** `GraviteeConfigurationSecretResolver` memoises every `SecretMap` in a map keyed by path and never evicts, ignoring the expiry the SPI carries. Rotating a secret referenced from `gravitee.yml` therefore requires a gateway restart. Mode A2 does not go through that resolver, precisely so its TTL means something.
+> **Mode A1 resolves at startup and caches for the lifetime of the process.** `GraviteeConfigurationSecretResolver` memoises every `SecretMap` in a map keyed by path and never evicts, ignoring the expiry the SPI carries. Rotating a secret referenced from `gravitee.yml` therefore requires a gateway restart. Modes A2 and A3 do not go through that resolver, precisely so its TTL means something.
+
+Mode A3 adds a second interval on top of the TTL: it re-resolves what it substituted every `deployTime.rotationCheckSeconds` and redeploys the affected API in place. The worst case for A3 is therefore `secretTtlSeconds + rotationCheckSeconds`, and setting `rotationCheckSeconds` below the TTL buys nothing because the resolver cache answers from memory. See [Mode A3](#rotation-works-without-a-gateway-restart).
 
 ## Switching between A2 and B
 
@@ -231,6 +377,7 @@ No API definition changes, with one exception. The shim registers the EL variabl
 
 - **A2 → B:** install the enterprise `service-secrets` plugin, set `secrets.gcp.el.enabled: false`. Keep the secret-provider ZIP — mode B still resolves *through* it.
 - **B → A2:** remove the enterprise plugin, set `secrets.gcp.el.enabled: true`, add the whitelist entries.
+- **A3 → B:** not a deployment change. The enterprise plugin has no deploy-time substitution, so every `secret://gcp/...` reference inside an API definition has to be rewritten first. Grep for `secret://gcp/` in your definitions before switching.
 
 **Both at once fails fast.** Both register `secrets`, and which one wins depends on bean registration order — so the shim refuses to start when it finds the enterprise service, with a message telling you which switch to flip. There is deliberately no silent precedence rule.
 
@@ -246,8 +393,14 @@ mvn prettier:write license:format   # fix formatting and licence headers
 ```
 
 `-Pintegration-test` is what covers the parts of this that live in the gateway rather than in the
-code — classloader placement, the `spring.factories` registration, and secret-provider configuration
-discovery. It needs Docker but no GCP account, and it runs on every pull request.
+code. It needs Docker but no GCP account, and it runs on every pull request. Three suites, each
+booting a real gateway:
+
+| Suite | What it establishes |
+| --- | --- |
+| `GcpGatewayBootstrapIT` | The artifacts load and the beans initialise — classloader placement, the `spring.factories` registration, secret-provider configuration discovery. No API is deployed. |
+| `GcpDeployTimeSubstitutionIT` | Mode A3 rotation with no gateway restart, and the `/_node/apis/<id>` exposure, against a deployed API served through a local registry. |
+| `GcpDeployTimeRevocationIT` | Mode A3 across a redeploy and an undeploy: a superseded revision's `REVOKE` does not release what the live revision needs, and an undeploy does release it. |
 
 There is also an optional profile that resolves a secret out of a real GCP Secret Manager. It needs a
 project, a token, and a secret of your own whose payload is a flat JSON object with `username` and

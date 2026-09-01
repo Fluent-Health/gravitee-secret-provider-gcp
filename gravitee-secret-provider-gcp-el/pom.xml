@@ -53,6 +53,11 @@
             <scope>provided</scope>
         </dependency>
         <dependency>
+            <groupId>io.gravitee.common</groupId>
+            <artifactId>gravitee-common</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
             <groupId>org.springframework</groupId>
             <artifactId>spring-context</artifactId>
             <scope>provided</scope>
@@ -129,6 +134,16 @@
             <artifactId>gravitee-secret-provider-gcp</artifactId>
             <version>${project.version}</version>
             <type>zip</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

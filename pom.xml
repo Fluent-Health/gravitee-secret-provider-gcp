@@ -69,6 +69,9 @@
         <gravitee-secret-api.version>3.0.0</gravitee-secret-api.version>
         <gravitee-expression-language.version>4.4.0</gravitee-expression-language.version>
         <gravitee-node.version>9.4.0</gravitee-node.version>
+        <!-- Carries io.gravitee.common.event.EventManager, the bus the deploy-time
+             substitution spike subscribes to. Version read off the 4.12.12 image. -->
+        <gravitee-common.version>5.0.0</gravitee-common.version>
         <!-- APIM 4.12 is on Vert.x 5. Declared explicitly so the compile-time major can
              never silently diverge from the gateway's. -->
         <vertx.version>5.0.12</vertx.version>
@@ -124,6 +127,11 @@
                 <groupId>io.gravitee.node</groupId>
                 <artifactId>gravitee-node-secrets-config</artifactId>
                 <version>${gravitee-node.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.gravitee.common</groupId>
+                <artifactId>gravitee-common</artifactId>
+                <version>${gravitee-common.version}</version>
             </dependency>
             <dependency>
                 <groupId>io.vertx</groupId>
